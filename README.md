@@ -43,3 +43,15 @@ This follows AC5's verify, generate, CMake build and play workflow, with VU capt
 ## Reporting problems
 
 Include your GPU/driver, Windows version, game executable hash, build commit, scene/mission, reproduction steps, and whether the issue occurs with a native VU build. Check logs for private paths before sharing. Do not attach ISOs, extracted game files, saves, generated sources, or raw game captures to issues.
+
+## Contributing and tests
+
+Contributors must write/update unit and acceptance tests, review their adequacy, and run them before submitting changes. Reviewers must inspect the tests and acceptance evidence before merge. See [CONTRIBUTING.md](CONTRIBUTING.md) and [TESTING.md](TESTING.md).
+
+```powershell
+.\build.cmd -Action Test
+# Or:
+python tools/run_tests.py --suite all
+```
+
+The public suites use synthetic inputs and do not require a game ISO or compiler. GitHub Actions is configured to run them on Windows. Game/runtime changes additionally require applicable native regression checks and local game acceptance; passing launcher tests does not certify gameplay.

@@ -1,11 +1,12 @@
 [CmdletBinding(PositionalBinding=$false)]
 param(
-    [ValidateSet('Build','Play','Optimize','Check')][string]$Action='Build',
+    [ValidateSet('Build','Play','Optimize','Check','Test')][string]$Action='Build',
     [Parameter(Position=0)][string]$Iso,
     [string]$Toolchain,
     [ValidateRange(1,64)][int]$Jobs=4,
     [ValidateSet('stream','memory')][string]$DiscCache='stream',
-    [switch]$NonInteractive
+    [switch]$NonInteractive,
+    [ValidateSet('all','unit','acceptance')][string]$TestSuite='all'
 )
 $ErrorActionPreference='Stop'
 $PSNativeCommandUseErrorActionPreference=$false
@@ -42,6 +43,14 @@ function Invoke-Builder([string[]]$Arguments) {
 
 try {
     if (-not $Toolchain -and $config) { $Toolchain=$config.toolchain }
+    if ($Action -eq 'Test') {
+        if (-not $Toolchain) { $Toolchain='C:\msys64\ucrt64' }
+        $script:python=Find-Python $Toolchain
+        $prefixArgs=@($script:python.Prefix)
+        & $script:python.Exe @prefixArgs (Join-Path $PSScriptRoot 'tools/run_tests.py') --suite $TestSuite
+        if ($LASTEXITCODE -ne 0) { throw 'Tests failed. Review the failures above before submitting changes.' }
+        exit 0
+    }
     if (-not $Toolchain) {
         $candidates=@($env:MSYSTEM_PREFIX,'C:\msys64\ucrt64')
         $gcc=Get-Command gcc.exe -ErrorAction SilentlyContinue

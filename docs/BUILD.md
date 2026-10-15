@@ -83,3 +83,7 @@ The run command defaults to 60 FPS, original game timing, startup preparation an
 Movie audio was accepted by the user on the preserved development build after playing through Mission 2. This does not certify the full campaign. Performance spikes remain, particularly first-use shaders and scene preparation. Capture-VU mode intentionally runs more slowly and is not a native performance benchmark.
 
 The publication workflow is validated separately from gameplay. See the repository release notes for the exact validation performed; do not assume a full clean-room campaign test. Older `native-poc.ps1`/`ac4.ps1` scripts are developer workflows with a sibling `toolchain/msys64` layout; use `setup_ac4.py` for configurable public installs.
+
+## Test before contributing
+
+Run `build.cmd -Action Test` to execute public unit and acceptance suites. No ISO/compiler is required for these tests. See [TESTING.md](../TESTING.md) for coverage, targeted runtime checks and manual game acceptance, and [CONTRIBUTING.md](../CONTRIBUTING.md) for the required write/review/run process.

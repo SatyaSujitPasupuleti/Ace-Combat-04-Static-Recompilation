@@ -46,3 +46,7 @@ Existing compiler sign-comparison warnings and whitespace warnings in inherited/
 - ISO file-picker interaction is left for manual review. No runtime/game behavior changes were introduced by this launcher update.
 
 Drag-and-drop launcher argument validation: real ISO hash check passed via positional `.cmd` invocation. Isolated `.cmd` build-routing test passed with spaces in the repository/ISO paths and an ampersand in the ISO filename. Explorer mouse interaction itself remains a manual check.
+
+## Contributor test suites
+
+The public runner passed 21 tests locally: 12 units (launch behavior and synthetic ISO parsing/verification) and 9 Windows launcher acceptance scenarios. Reviewed fixture isolation, assertions, failure propagation and timeouts. The CI workflow is configured but has not run remotely because publication remains pending approval. These checks do not replace game acceptance or hardware-dependent runtime tests.
