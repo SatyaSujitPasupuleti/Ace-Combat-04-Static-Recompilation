@@ -25,7 +25,8 @@ class WindowsLauncherAcceptance(unittest.TestCase):
         self.iso.touch()
         toolchain = self.root / 'fake ucrt64'
         (toolchain / 'bin').mkdir(parents=True)
-        (toolchain / 'bin/gcc.exe').touch()  # Discovery only; never executed.
+        for name in ('gcc.exe', 'g++.exe', 'cmake.exe', 'ninja.exe', 'pkg-config.exe', 'glslc.exe'):
+            (toolchain / 'bin' / name).touch()  # Discovery only; never executed.
         (self.root / 'local.json').write_text(json.dumps({'iso': str(self.iso), 'toolchain': str(toolchain)}))
         (self.root / 'tools/setup_ac4.py').write_text(
             "import json,os,sys\nfrom pathlib import Path\n"
@@ -61,6 +62,27 @@ class WindowsLauncherAcceptance(unittest.TestCase):
 
     def test_saved_paths_build_without_prompt(self):
         self.check(['prepare', 'build'], '-NonInteractive')
+
+    def test_incomplete_gcc_install_is_skipped_for_complete_toolchain(self):
+        config = json.loads((self.root / 'local.json').read_text())
+        complete = config['toolchain']
+        config['toolchain'] = ''
+        (self.root / 'local.json').write_text(json.dumps(config))
+        incomplete = self.root / 'gcc-only'
+        (incomplete / 'bin').mkdir(parents=True)
+        (incomplete / 'bin/gcc.exe').touch()
+        self.env['AC4_TOOLCHAIN'] = str(incomplete)
+        self.env['MSYSTEM_PREFIX'] = complete
+        calls = self.check(['prepare', 'build'], '-NonInteractive')
+        self.assertEqual(calls[0][calls[0].index('--toolchain')+1], complete)
+
+    def test_explicit_incomplete_toolchain_reports_missing_cmake(self):
+        config = json.loads((self.root / 'local.json').read_text())
+        (Path(config['toolchain']) / 'bin/cmake.exe').unlink()
+        result, calls = self.invoke('-Toolchain', config['toolchain'], '-NonInteractive')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('cmake.exe', result.stdout)
+        self.assertEqual(calls, [])
 
     def test_existing_capture_selects_native_build(self):
         path = self.root / 'out/vu_programs'

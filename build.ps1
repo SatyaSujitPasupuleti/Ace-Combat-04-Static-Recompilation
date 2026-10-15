@@ -41,6 +41,12 @@ function Invoke-Builder([string[]]$Arguments) {
     if ($LASTEXITCODE -ne 0) { throw "Build helper failed (exit $LASTEXITCODE). See the output above; no later steps were run." }
 }
 
+function Get-MissingTools([string]$Prefix) {
+    foreach ($name in @('gcc.exe','g++.exe','cmake.exe','ninja.exe','pkg-config.exe','glslc.exe')) {
+        if (-not $Prefix -or -not (Test-Path -LiteralPath (Join-Path $Prefix ('bin/'+$name)) -PathType Leaf)) { $name }
+    }
+}
+
 try {
     if (-not $Toolchain -and $config) { $Toolchain=$config.toolchain }
     if ($Action -eq 'Test') {
@@ -51,19 +57,32 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Tests failed. Review the failures above before submitting changes.' }
         exit 0
     }
-    if (-not $Toolchain) {
-        $candidates=@($env:MSYSTEM_PREFIX,'C:\msys64\ucrt64')
-        $gcc=Get-Command gcc.exe -ErrorAction SilentlyContinue
-        if ($gcc) { $candidates+=Split-Path (Split-Path $gcc.Source -Parent) -Parent }
+    if ($PSBoundParameters.ContainsKey('Toolchain') -and @(Get-MissingTools $Toolchain).Count) {
+        throw "Selected toolchain is incomplete: $Toolchain. Missing: $((Get-MissingTools $Toolchain) -join ', '). Install the UCRT64 packages in docs/BUILD.md or select another -Toolchain."
+    }
+    if (-not $Toolchain -or @(Get-MissingTools $Toolchain).Count) {
+        $Toolchain=$null
+        $candidates=@($env:AC4_TOOLCHAIN,$env:MSYSTEM_PREFIX)
+        # Support a project-local MSYS2 install without embedding a developer drive/path.
+        $ancestor=$PSScriptRoot
+        for ($depth=0; $depth -lt 3 -and $ancestor; $depth++) {
+            $candidates+=Join-Path $ancestor 'toolchain/msys64/ucrt64'
+            $ancestor=Split-Path $ancestor -Parent
+        }
+        $candidates+='C:\msys64\ucrt64'
+        foreach ($gcc in @(Get-Command gcc.exe -All -ErrorAction SilentlyContinue)) {
+            if ($gcc.Source) { $candidates+=Split-Path (Split-Path $gcc.Source -Parent) -Parent }
+        }
         foreach ($candidate in $candidates) {
-            if ($candidate -and (Test-Path -LiteralPath (Join-Path $candidate 'bin/gcc.exe'))) { $Toolchain=$candidate; break }
+            if ($candidate -and @(Get-MissingTools $candidate).Count -eq 0) { $Toolchain=$candidate; break }
         }
     }
-    if (-not $Toolchain -or -not (Test-Path -LiteralPath (Join-Path $Toolchain 'bin/gcc.exe'))) {
-        if ($NonInteractive) { throw 'MSYS2 UCRT64 not found. Pass -Toolchain C:\msys64\ucrt64. See docs/BUILD.md for installation.' }
+    if (-not $Toolchain) {
+        if ($NonInteractive) { throw 'No complete toolchain found (GCC, G++, CMake, Ninja, pkg-config, glslc required). Pass -Toolchain C:\msys64\ucrt64. See docs/BUILD.md.' }
         Write-Host 'Install MSYS2 and its UCRT64 packages first; see docs/BUILD.md.'
         $Toolchain=(Read-Host 'MSYS2 UCRT64 folder (for example C:\msys64\ucrt64)').Trim().Trim('"')
     }
+    if (@(Get-MissingTools $Toolchain).Count) { throw "Incomplete toolchain. Missing: $((Get-MissingTools $Toolchain) -join ', '). See docs/BUILD.md." }
     $Toolchain=(Resolve-Path -LiteralPath $Toolchain).Path
     $script:python=Find-Python $Toolchain
     if ($Action -eq 'Play') {

@@ -5,8 +5,8 @@
 /out/
 /saves/
 /local.json
-*.iso
-*.ISO
+# Disc images, including mixed-case extensions, anywhere in the repository.
+*.[iI][sS][oO]
 *.cso
 *.chd
 SLUS_*

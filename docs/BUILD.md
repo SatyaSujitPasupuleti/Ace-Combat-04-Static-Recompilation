@@ -17,7 +17,7 @@ The Python build tool uses only the standard library. No Ghidra installation is 
 
 ## Easy build and play
 
-**Drag and drop one ISO onto `build.cmd`** in Explorer to select it and start building. Alternatively, double-click **build.cmd** to use the ISO picker. Dropped paths containing spaces are supported; the selected ISO path is remembered for future builds. Drop the ISO onto the script file, not onto an already-running terminal window. It reuses saved paths on subsequent runs. On first use it detects `C:\msys64\ucrt64` or a toolchain on PATH (or asks for its location), finds Python, and opens an ISO file picker. It verifies the executable, generates code and builds a playable executable. Compilation can take several minutes. If anything fails, later stages stop and the terminal stays open so you can read the error.
+**Drag and drop one ISO onto `build.cmd`** in Explorer to select it and start building. Alternatively, double-click **build.cmd** to use the ISO picker. Dropped paths containing spaces are supported; the selected ISO path is remembered for future builds. Drop the ISO onto the script file, not onto an already-running terminal window. It reuses saved paths on subsequent runs. On first use it checks `AC4_TOOLCHAIN`/`MSYSTEM_PREFIX`, nearby `toolchain/msys64/ucrt64` folders, `C:\msys64\ucrt64`, and toolchains on PATH (or asks for a location), finds Python, and opens an ISO file picker. It verifies the executable, generates code and builds a playable executable. Compilation can take several minutes. If anything fails, later stages stop and the terminal stays open so you can read the error.
 
 Then double-click **play.cmd**. It supplies ISO/data/shader paths and the DLL search path automatically. It prefers a built native VU executable, otherwise bootstrap. The launchers support paths containing spaces and do not permanently change your system PATH or execution policy.
 
@@ -87,3 +87,5 @@ The publication workflow is validated separately from gameplay. See the reposito
 ## Test before contributing
 
 Run `build.cmd -Action Test` to execute public unit and acceptance suites. No ISO/compiler is required for these tests. See [TESTING.md](../TESTING.md) for coverage, targeted runtime checks and manual game acceptance, and [CONTRIBUTING.md](../CONTRIBUTING.md) for the required write/review/run process.
+
+Toolchain discovery requires GCC, G++, CMake, Ninja, pkg-config and glslc together. A GCC-only MinGW installation on PATH is skipped. An explicitly selected incomplete toolchain reports the missing tools instead of silently switching installations. Dependency/compiler compatibility is still checked by CMake during the build.
