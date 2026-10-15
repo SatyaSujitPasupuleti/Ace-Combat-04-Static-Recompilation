@@ -88,16 +88,18 @@ def build(cfg, native, jobs):
     call([prefix / 'cmake.exe', '--build', build_dir, '--target', 'ac4', '-j', jobs], env)
 
 
-def run(cfg, capture, memory):
+def run(cfg, capture, memory, renderer='auto'):
     env = environment(cfg)
     (ROOT / 'saves').mkdir(exist_ok=True)
-    folder = ROOT / ('build/bootstrap' if capture else 'build/native-poc')
+    native = not capture and renderer != 'bootstrap' and (
+        renderer == 'native' or (ROOT / 'build/native-poc/ac4.exe').is_file())
+    folder = ROOT / ('build/native-poc' if native else 'build/bootstrap')
     if not (folder / 'ac4.exe').is_file():
         raise ValueError('Build the selected executable first.')
     env.update(PS2_SHADER_DIR=str(folder / 'shaders'),
                PS2_SETTINGS_FILE=str(folder / 'ac4_settings.ini'),
                PS2_PIPELINE_CACHE=str(folder / 'ac4_pipelines'),
-               PS2_VU_RECOMP='0' if capture else '1', PS2_FPS_CAP='60',
+               PS2_VU_RECOMP='1' if native else '0', PS2_FPS_CAP='60',
                PS2_AC4_OPENING='Show', PS2_PRESENT_QUEUE='1',
                PS2_T4_PARTIAL='1', PS2_T4_SOURCE_HASH='1',
                PS2_PIPELINE_PREWARM='1', PS2_IMAGE_PREWARM='15',
@@ -108,21 +110,23 @@ def run(cfg, capture, memory):
         print('Capture: play representative scenes, then exit with Escape. Each session replaces the manifest.', flush=True)
     if memory:
         env['PS2_DISC_PRELOAD'] = '1'
+    print('Running ' + ('native VU' if native else 'bootstrap / interpreted VU') + ' build.', flush=True)
     call([folder / 'ac4.exe', '--data', ROOT / 'generated', '--disc', cfg['iso'],
           '--seconds', '0', '--vblanks', '0', '--watchdog', '30'], env)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('action', choices=['prepare', 'build', 'capture-vu', 'build-native', 'run'])
+    ap.add_argument('action', choices=['check', 'prepare', 'build', 'capture-vu', 'build-native', 'run'])
     ap.add_argument('--iso', type=Path)
     ap.add_argument('--toolchain', type=Path, help='MSYS2 ucrt64 prefix, e.g. C:/msys64/ucrt64')
     ap.add_argument('--jobs', type=int, default=4)
     ap.add_argument('--disc-cache', choices=['stream', 'memory'], default='stream')
+    ap.add_argument('--renderer', choices=['auto', 'bootstrap', 'native'], default='auto')
     args = ap.parse_args()
     if args.jobs < 1:
         ap.error('--jobs must be positive')
-    if args.action == 'prepare':
+    if args.action in ('prepare', 'check'):
         if not args.iso or not args.toolchain:
             ap.error('prepare needs --iso and --toolchain')
         cfg = {'iso': str(args.iso.resolve()), 'toolchain': str(args.toolchain.resolve())}
@@ -130,6 +134,9 @@ def main():
             if not (args.toolchain / 'bin' / binary).is_file():
                 raise ValueError('Missing toolchain binary: ' + binary)
         data = extract(args.iso)
+        if args.action == 'check':
+            print('Toolchain binaries found. Supported ISO executable verified. Ready to build.')
+            return
         work = ROOT / 'work/public-input'
         work.mkdir(parents=True, exist_ok=True)
         elf = work / PROFILE['serial']
@@ -144,7 +151,7 @@ def main():
     if args.action in ('build', 'build-native'):
         build(cfg, args.action == 'build-native', args.jobs)
     else:
-        run(cfg, args.action == 'capture-vu', args.disc_cache == 'memory')
+        run(cfg, args.action == 'capture-vu', args.disc_cache == 'memory', args.renderer)
 
 
 if __name__ == '__main__':

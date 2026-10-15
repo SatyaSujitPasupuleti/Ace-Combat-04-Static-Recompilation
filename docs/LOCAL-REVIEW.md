@@ -7,9 +7,9 @@ Review `README.md`, `CREDITS.md`, `LICENSE`, and `docs/BUILD.md`. The source con
 For local play after building:
 
 ```powershell
-python tools/setup_ac4.py run --disc-cache memory
+.\play.cmd -DiscCache memory
 ```
 
-If `python` is not available on PATH, use a Python 3 executable's full path. The ignored `local.json` already points to the developer's ISO and MSYS2 installation on this machine. The runtime/source files are copies of the accepted development build; public setup/build documentation is new. The original development checkout is unchanged.
+The launcher detects Python from the saved toolchain or installed Python. The ignored `local.json` already points to the developer's ISO and MSYS2 installation on this machine. The runtime/source files are copies of the accepted development build; public setup/build documentation is new. The original development checkout is unchanged.
 
 Game data, generated sources, executables, VU captures, settings, saves, and local machine paths are excluded from Git. Only reviewed source and documentation will be pushed after approval. No game executable is planned as a release asset.

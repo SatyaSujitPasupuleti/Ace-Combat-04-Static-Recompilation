@@ -25,15 +25,20 @@ One 544.8-second development run averaged 59.95 CPU submissions/s, with p99 23.9
 
 Read the [Windows build guide](docs/BUILD.md). The repository does not ship a game executable, ISO, extracted game files, generated game code, captured VU images, or memory-card saves. You generate these locally from your own copy.
 
+After installing the prerequisites in the [build guide](docs/BUILD.md):
+
+1. Double-click **`build.cmd`**. It detects Python/MSYS2, asks you to select your ISO on first use, verifies the supported executable, generates the code and builds it.
+2. Double-click **`play.cmd`** to play. No terminal environment setup is needed.
+3. Optional: run `build.cmd -Action Optimize` to capture VU programs during a play session and compile them after you exit with Escape. Future builds reuse that local capture.
+
+For a scripted build:
+
 ```powershell
-python tools/setup_ac4.py prepare --iso "D:\Games\AC04.iso" --toolchain "C:\msys64\ucrt64"
-python tools/setup_ac4.py build
-python tools/setup_ac4.py capture-vu
-python tools/setup_ac4.py build-native
-python tools/setup_ac4.py run
+.\build.ps1 -Iso "D:\Games\AC04.iso" -Toolchain "C:\msys64\ucrt64" -NonInteractive
+.\build.ps1 -Action Play
 ```
 
-During `capture-vu`, play through the opening, menus, briefing and flight, then exit with Escape to write the captured vector programs. This first pass uses interpreted VU execution and can be slower. The native build compiles the programs you encountered; unseen programs still work through fallback. This makes the source build reproducible without distributing game microcode, but does not promise identical performance to the developer's captured corpus.
+This follows AC5's verify, generate, CMake build and play workflow, with VU capture as an optional optimization. A first build is playable with interpreted VU execution. Native VU performance requires a representative capture: opening, menus, briefing and flight. Unseen programs retain interpreter fallback. Captures and all generated game files stay local and ignored by Git. The scripts do not install packages or download game data.
 
 ## Reporting problems
 
