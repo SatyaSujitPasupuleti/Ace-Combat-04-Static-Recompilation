@@ -1,0 +1,6 @@
+{
+  "sceSifInitRpc": "hle_sceSifInitRpc",
+  "sceSifBindRpc": "hle_sceSifBindRpc",
+  "sceSifCallRpc": "hle_sceSifCallRpc",
+  "sceSifCheckStatRpc": "hle_sceSifCheckStatRpc"
+}

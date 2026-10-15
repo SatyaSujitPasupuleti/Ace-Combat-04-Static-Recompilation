@@ -1,0 +1,12 @@
+{
+  "game": "Ace Combat 04 - Shattered Skies",
+  "serial": "SLUS_201.52",
+  "upstream_commit": "078662b4018b5e79d5aa5ee9b9c60aceec9e7649",
+  "elf_sha256": "38ecebd6965c2f74ec8973f538781506bf3a2cfad86f908deb6c5d585d528301",
+  "entry": "0x00100008",
+  "text_start": "0x00100000",
+  "text_end": "0x00297B34",
+  "native_renderer": false,
+  "ac5_iop_services": false,
+  "strict_unknown_targets": true
+}

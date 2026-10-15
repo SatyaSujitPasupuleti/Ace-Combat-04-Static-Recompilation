@@ -1,0 +1,456 @@
+{
+  "0x0027CF88": {
+    "name": "ac4_empty_constructor",
+    "confidence": "verified",
+    "evidence": "Constructor table 0x0029F308 has count 10; pointer at 0x0029F328. Body is JR ra; NOP. Observed indirect target in boot_001_missing_leaf.log."
+  },
+  "0x002124F8": {
+    "name": "ac4_static_constructor_002124F8",
+    "confidence": "verified",
+    "evidence": "Constructor table pointer at 0x0029F31C; caller 0x0028892C, return address 0x00288934. Body sets a0=0x002BBA00, a1=64 and tail-jumps to 0x002140A8. Observed in boot_002_constructor.log."
+  },
+  "0x0026B2F8": {
+    "name": "ac4_startup_worker",
+    "confidence": "verified entry; provisional semantic name",
+    "evidence": "CreateThread and thread-entry dispatch in boot_003_thread.log; stack allocation and saved registers verified in ELF disassembly."
+  },
+  "0x0026BDA8": {
+    "name": "ac4_sif0_dma_handler",
+    "confidence": "verified registration; provisional semantic name",
+    "evidence": "AddDmacHandler(ch=5,handler=0026BDA8) in boot_003_thread.log; prologue verified in ELF disassembly. Execution not yet observed."
+  },
+  "0x00265A40": {
+    "name": "sceSifInitRpc",
+    "confidence": "instruction and ABI verified",
+    "evidence": "Registers SIF RPC command IDs 0x80000008/09/0A/0C and initializes packet tables; called by AC4 startup at 0x0010042C.",
+    "reference": "https://github.com/ps2dev/ps2sdk/blob/master/ee/kernel/src/sifrpc.c"
+  },
+  "0x002660B0": {
+    "name": "sceSifBindRpc",
+    "confidence": "instruction and ABI verified",
+    "evidence": "a0 client, a1 SID, a2 mode; clears client+0x10/+0x24; sends command 0x80000009; synchronous WaitSema at 0x00266180; observed hang binding disc init SID 0x80000592.",
+    "reference": "https://github.com/ps2dev/ps2sdk/blob/master/ee/kernel/src/sifrpc.c"
+  },
+  "0x00266280": {
+    "name": "sceSifCallRpc",
+    "confidence": "instruction and ABI verified",
+    "evidence": "Client+0x1C end function and +0x20 end argument; fno/send/recv sizes copied into RPC packet; 8-register plus stack argument ABI verified in generated body.",
+    "reference": "https://github.com/ps2dev/ps2sdk/blob/master/ee/kernel/src/sifrpc.c"
+  },
+  "0x00266470": {
+    "name": "sceSifCheckStatRpc",
+    "confidence": "instruction and ABI verified",
+    "evidence": "Tests client packet address, matching rpc_id, and packet rec_id allocated bit; returns 0/1.",
+    "reference": "https://github.com/ps2dev/ps2sdk/blob/master/ee/kernel/src/sifrpc.c"
+  },
+  "0x0026EE00": {
+    "name": "ac4_cd_read_completion",
+    "confidence": "observed dispatch target; instruction entry checked",
+    "evidence": "Read RPC completion callback at RA 0026FF78; first sector read to 00421880; instruction sequence checks alignment-copy metadata then callback state."
+  },
+  "0x0026EBC8": {
+    "name": "ac4_cd_generic_completion",
+    "confidence": "observed dispatch target; instruction entry checked",
+    "evidence": "Observed ReadIOPMem RPC completion; verified stack-frame entry at 26EBC8"
+  },
+  "0x00260E80": {
+    "name": "ac4_startup_state_260E80",
+    "confidence": "observed dispatch target; instruction entry checked",
+    "evidence": "Startup callback table 003F8708..003F872C consumed by 002613F0; first observed dispatch 00260E80; aligned instruction entries verified"
+  },
+  "0x00260FC0": {
+    "name": "ac4_startup_state_260FC0",
+    "confidence": "observed dispatch target; instruction entry checked",
+    "evidence": "Startup callback table 003F8708..003F872C consumed by 002613F0; first observed dispatch 00260E80; aligned instruction entries verified"
+  },
+  "0x00260FE8": {
+    "name": "ac4_startup_state_260FE8",
+    "confidence": "observed dispatch target; instruction entry checked",
+    "evidence": "Startup callback table 003F8708..003F872C consumed by 002613F0; first observed dispatch 00260E80; aligned instruction entries verified"
+  },
+  "0x00261100": {
+    "name": "ac4_startup_state_261100",
+    "confidence": "observed dispatch target; instruction entry checked",
+    "evidence": "Startup callback table 003F8708..003F872C consumed by 002613F0; first observed dispatch 00260E80; aligned instruction entries verified"
+  },
+  "0x00261128": {
+    "name": "ac4_startup_state_261128",
+    "confidence": "observed dispatch target; instruction entry checked",
+    "evidence": "Startup callback table 003F8708..003F872C consumed by 002613F0; first observed dispatch 00260E80; aligned instruction entries verified"
+  },
+  "0x002611A0": {
+    "name": "ac4_startup_state_2611A0",
+    "confidence": "observed dispatch target; instruction entry checked",
+    "evidence": "Startup callback table 003F8708..003F872C consumed by 002613F0; first observed dispatch 00260E80; aligned instruction entries verified"
+  },
+  "0x002611D8": {
+    "name": "ac4_startup_state_2611D8",
+    "confidence": "observed dispatch target; instruction entry checked",
+    "evidence": "Startup callback table 003F8708..003F872C consumed by 002613F0; first observed dispatch 00260E80; aligned instruction entries verified"
+  },
+  "0x00261378": {
+    "name": "ac4_startup_state_261378",
+    "confidence": "observed dispatch target; instruction entry checked",
+    "evidence": "Startup callback table 003F8708..003F872C consumed by 002613F0; first observed dispatch 00260E80; aligned instruction entries verified"
+  },
+  "0x00261398": {
+    "name": "ac4_startup_state_261398",
+    "confidence": "observed dispatch target; instruction entry checked",
+    "evidence": "Startup callback table 003F8708..003F872C consumed by 002613F0; first observed dispatch 00260E80; aligned instruction entries verified"
+  },
+  "0x002613D0": {
+    "name": "ac4_startup_state_2613D0",
+    "confidence": "observed dispatch target; instruction entry checked",
+    "evidence": "Startup callback table 003F8708..003F872C consumed by 002613F0; first observed dispatch 00260E80; aligned instruction entries verified"
+  },
+  "0x0026D988": {
+    "name": "ac4_rpc_completion_0026D988",
+    "confidence": "literal SifCallRpc end_func argument",
+    "evidence": "a7 address construction before calls 0026DAE0"
+  },
+  "0x0026DE08": {
+    "name": "ac4_rpc_completion_0026DE08",
+    "confidence": "literal SifCallRpc end_func argument",
+    "evidence": "a7 address construction before calls 0026DF8C"
+  },
+  "0x0026E140": {
+    "name": "ac4_rpc_completion_0026E140",
+    "confidence": "literal SifCallRpc end_func argument",
+    "evidence": "a7 address construction before calls 0026E2C0"
+  },
+  "0x002922F0": {
+    "name": "ac4_stream_callback_2922F0",
+    "confidence": "observed dispatch target; instruction entry checked",
+    "evidence": "Verified callback pointers installed by 0028FDD0 at stream offsets 20..2C; live dispatch 00292358 from 0028FD3C"
+  },
+  "0x00292358": {
+    "name": "ac4_stream_callback_292358",
+    "confidence": "observed dispatch target; instruction entry checked",
+    "evidence": "Verified callback pointers installed by 0028FDD0 at stream offsets 20..2C; live dispatch 00292358 from 0028FD3C"
+  },
+  "0x002923D8": {
+    "name": "ac4_stream_callback_2923D8",
+    "confidence": "observed dispatch target; instruction entry checked",
+    "evidence": "Verified callback pointers installed by 0028FDD0 at stream offsets 20..2C; live dispatch 00292358 from 0028FD3C"
+  },
+  "0x00292440": {
+    "name": "ac4_stream_callback_292440",
+    "confidence": "observed dispatch target; instruction entry checked",
+    "evidence": "Verified callback pointers installed by 0028FDD0 at stream offsets 20..2C; live dispatch 00292358 from 0028FD3C"
+  },
+  "0x00216470": {
+    "name": "ac4_data_callback_00216470",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 0033D758"
+  },
+  "0x002166A8": {
+    "name": "ac4_data_callback_002166A8",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 0033D9FC"
+  },
+  "0x002183E8": {
+    "name": "ac4_data_callback_002183E8",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 0033E110"
+  },
+  "0x0021AF18": {
+    "name": "ac4_data_callback_0021AF18",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 003520D4"
+  },
+  "0x0021EC80": {
+    "name": "ac4_data_callback_0021EC80",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 0035439C"
+  },
+  "0x0021F238": {
+    "name": "ac4_data_callback_0021F238",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 00354580"
+  },
+  "0x0021F998": {
+    "name": "ac4_data_callback_0021F998",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 00365CC8"
+  },
+  "0x002261B8": {
+    "name": "ac4_data_callback_002261B8",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 00384640"
+  },
+  "0x0024C328": {
+    "name": "ac4_data_callback_0024C328",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 003B0190"
+  },
+  "0x0025C058": {
+    "name": "ac4_data_callback_0025C058",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 003F6C5C"
+  },
+  "0x0025F340": {
+    "name": "ac4_data_callback_0025F340",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 003F84E4"
+  },
+  "0x0025F438": {
+    "name": "ac4_data_callback_0025F438",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 003F8540"
+  },
+  "0x0025F6B8": {
+    "name": "ac4_data_callback_0025F6B8",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 003F85B8"
+  },
+  "0x0025F820": {
+    "name": "ac4_data_callback_0025F820",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 003F85F4"
+  },
+  "0x0025F900": {
+    "name": "ac4_data_callback_0025F900",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 003F8628"
+  },
+  "0x0025FD50": {
+    "name": "ac4_data_callback_0025FD50",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 003F86D4"
+  },
+  "0x00275F48": {
+    "name": "ac4_data_callback_00275F48",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 003FD8DC"
+  },
+  "0x0027D2B8": {
+    "name": "ac4_data_callback_0027D2B8",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 003FFF80"
+  },
+  "0x00289178": {
+    "name": "ac4_data_callback_00289178",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 004006A4,004007A4"
+  },
+  "0x00289070": {
+    "name": "ac4_data_callback_00289070",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 004006E4"
+  },
+  "0x00289128": {
+    "name": "ac4_data_callback_00289128",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 00400764"
+  },
+  "0x00289150": {
+    "name": "ac4_data_callback_00289150",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 00400784"
+  },
+  "0x002891A0": {
+    "name": "ac4_data_callback_002891A0",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 004007C4"
+  },
+  "0x00289208": {
+    "name": "ac4_data_callback_00289208",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 004007F4"
+  },
+  "0x002893A8": {
+    "name": "ac4_data_callback_002893A8",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 004008D0"
+  },
+  "0x0028C028": {
+    "name": "ac4_data_callback_0028C028",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 00400CC0"
+  },
+  "0x0028C070": {
+    "name": "ac4_data_callback_0028C070",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 00400D20"
+  },
+  "0x0028C660": {
+    "name": "ac4_data_callback_0028C660",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 00400F80,0040CE94"
+  },
+  "0x0028C6F8": {
+    "name": "ac4_data_callback_0028C6F8",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 00400FD8,0040CEAC"
+  },
+  "0x0028E410": {
+    "name": "ac4_data_callback_0028E410",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 004010B8,0040CFD4"
+  },
+  "0x0028EBF0": {
+    "name": "ac4_data_callback_0028EBF0",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 00401470,0040D094"
+  },
+  "0x0028EC88": {
+    "name": "ac4_data_callback_0028EC88",
+    "confidence": "allocated-data pointer and delayed stack-frame prologue",
+    "evidence": "ELF data references 004014C8,0040D0AC"
+  },
+  "0x00272010": {
+    "name": "ac4_movie_callback_00272010",
+    "confidence": "ELF callback registration or explicit function-pointer table",
+    "evidence": "Initializer 00270910 materializes callback at 00270970/00270980; observed dispatch from 00270D98"
+  },
+  "0x00272020": {
+    "name": "ac4_movie_callback_00272020",
+    "confidence": "ELF callback registration or explicit function-pointer table",
+    "evidence": "Initializer 00270910 materializes callback at 00270978/00270988; decoded tail wrapper to 00277670"
+  },
+  "0x00272FC8": {
+    "name": "ac4_movie_callback_00272FC8",
+    "confidence": "ELF callback registration or explicit function-pointer table",
+    "evidence": "ELF movie decoder table entry 003FD848; indirect dispatch in 00272E38"
+  },
+  "0x002730D8": {
+    "name": "ac4_movie_callback_002730D8",
+    "confidence": "ELF callback registration or explicit function-pointer table",
+    "evidence": "ELF movie decoder table entry 003FD84C; indirect dispatch in 00272E38"
+  },
+  "0x00273260": {
+    "name": "ac4_movie_callback_00273260",
+    "confidence": "ELF callback registration or explicit function-pointer table",
+    "evidence": "ELF movie decoder table entry 003FD850; indirect dispatch in 00272E38"
+  },
+  "0x002733C8": {
+    "name": "ac4_movie_callback_002733C8",
+    "confidence": "ELF callback registration or explicit function-pointer table",
+    "evidence": "ELF movie decoder table entry 003FD854; indirect dispatch in 00272E38"
+  },
+  "0x002735C0": {
+    "name": "ac4_movie_callback_002735C0",
+    "confidence": "ELF callback registration or explicit function-pointer table",
+    "evidence": "ELF movie decoder table entry 003FD858; indirect dispatch in 00272E38"
+  },
+  "0x00273718": {
+    "name": "ac4_movie_callback_00273718",
+    "confidence": "ELF callback registration or explicit function-pointer table",
+    "evidence": "ELF movie decoder table entry 003FD85C; indirect dispatch in 00272E38"
+  },
+  "0x002738E8": {
+    "name": "ac4_movie_callback_002738E8",
+    "confidence": "ELF callback registration or explicit function-pointer table",
+    "evidence": "ELF movie decoder table entry 003FD860; indirect dispatch in 00272E38"
+  },
+  "0x00273A98": {
+    "name": "ac4_movie_callback_00273A98",
+    "confidence": "ELF callback registration or explicit function-pointer table",
+    "evidence": "ELF movie decoder table entry 003FD864; indirect dispatch in 00272E38"
+  },
+  "0x00273040": {
+    "name": "ac4_movie_callback_00273040",
+    "confidence": "ELF callback registration or explicit function-pointer table",
+    "evidence": "ELF movie decoder table entry 003FD868; indirect dispatch in 00272E38"
+  },
+  "0x00273190": {
+    "name": "ac4_movie_callback_00273190",
+    "confidence": "ELF callback registration or explicit function-pointer table",
+    "evidence": "ELF movie decoder table entry 003FD86C; indirect dispatch in 00272E38"
+  },
+  "0x00273310": {
+    "name": "ac4_movie_callback_00273310",
+    "confidence": "ELF callback registration or explicit function-pointer table",
+    "evidence": "ELF movie decoder table entry 003FD870; indirect dispatch in 00272E38"
+  },
+  "0x002734C0": {
+    "name": "ac4_movie_callback_002734C0",
+    "confidence": "ELF callback registration or explicit function-pointer table",
+    "evidence": "ELF movie decoder table entry 003FD874; indirect dispatch in 00272E38"
+  },
+  "0x00273668": {
+    "name": "ac4_movie_callback_00273668",
+    "confidence": "ELF callback registration or explicit function-pointer table",
+    "evidence": "ELF movie decoder table entry 003FD878; indirect dispatch in 00272E38"
+  },
+  "0x00273800": {
+    "name": "ac4_movie_callback_00273800",
+    "confidence": "ELF callback registration or explicit function-pointer table",
+    "evidence": "ELF movie decoder table entry 003FD87C; indirect dispatch in 00272E38"
+  },
+  "0x002739C8": {
+    "name": "ac4_movie_callback_002739C8",
+    "confidence": "ELF callback registration or explicit function-pointer table",
+    "evidence": "ELF movie decoder table entry 003FD880; indirect dispatch in 00272E38"
+  },
+  "0x00273BC0": {
+    "name": "ac4_movie_callback_00273BC0",
+    "confidence": "ELF callback registration or explicit function-pointer table",
+    "evidence": "ELF movie decoder table entry 003FD884; indirect dispatch in 00272E38"
+  },
+  "0x00276E80": {
+    "name": "ac4_movie_dma3_handler",
+    "confidence": "observed dispatch target; instruction entry checked",
+    "evidence": "Observed AddDmacHandler channel 3 at field 3430; dispatch failed at 00276E80. Original entry acknowledges DMA3 and updates movie output completion state."
+  },
+  "0x0017D938": {
+    "name": "ac4_pause_callback_0017D938",
+    "confidence": "validated pause-menu descriptor callback",
+    "evidence": "ELF descriptor references 002B8138"
+  },
+  "0x0017D958": {
+    "name": "ac4_pause_callback_0017D958",
+    "confidence": "validated pause-menu descriptor callback",
+    "evidence": "ELF descriptor references 002B8170"
+  },
+  "0x0017D9A8": {
+    "name": "ac4_pause_callback_0017D9A8",
+    "confidence": "validated pause-menu descriptor callback",
+    "evidence": "ELF descriptor references 002B81A8, 002B8288"
+  },
+  "0x0017DA28": {
+    "name": "ac4_pause_callback_0017DA28",
+    "confidence": "validated pause-menu descriptor callback",
+    "evidence": "ELF descriptor references 002B81E0, 002B82C0"
+  },
+  "0x0017DAD8": {
+    "name": "ac4_pause_callback_0017DAD8",
+    "confidence": "validated pause-menu descriptor callback",
+    "evidence": "ELF descriptor references 002B8214"
+  },
+  "0x0017DAA8": {
+    "name": "ac4_pause_callback_0017DAA8",
+    "confidence": "validated pause-menu descriptor callback",
+    "evidence": "ELF descriptor references 002B8218"
+  },
+  "0x0017DB28": {
+    "name": "ac4_pause_callback_0017DB28",
+    "confidence": "validated pause-menu descriptor callback",
+    "evidence": "ELF descriptor references 002B824C"
+  },
+  "0x0017DAF0": {
+    "name": "ac4_pause_callback_0017DAF0",
+    "confidence": "validated pause-menu descriptor callback",
+    "evidence": "ELF descriptor references 002B8250"
+  },
+  "0x0017DB40": {
+    "name": "ac4_pause_callback_0017DB40",
+    "confidence": "validated pause-menu descriptor callback",
+    "evidence": "ELF descriptor references 002B82F8"
+  },
+  "0x0017DBC0": {
+    "name": "ac4_pause_callback_0017DBC0",
+    "confidence": "validated pause-menu descriptor callback",
+    "evidence": "ELF descriptor references 002B8330"
+  },
+  "0x0017DC48": {
+    "name": "ac4_pause_callback_0017DC48",
+    "confidence": "validated pause-menu descriptor callback",
+    "evidence": "ELF descriptor references 002B8364"
+  },
+  "0x0017DBD8": {
+    "name": "ac4_pause_callback_0017DBD8",
+    "confidence": "validated pause-menu descriptor callback",
+    "evidence": "ELF descriptor references 002B8368"
+  }
+}
