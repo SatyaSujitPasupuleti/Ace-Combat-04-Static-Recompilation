@@ -46,7 +46,9 @@ Include your GPU/driver, Windows version, game executable hash, build commit, sc
 
 ## Contributing and tests
 
-Contributors must write/update unit and acceptance tests, review their adequacy, and run them before submitting changes. Reviewers must inspect the tests and acceptance evidence before merge. See [CONTRIBUTING.md](CONTRIBUTING.md) and [TESTING.md](TESTING.md).
+To contribute, fork the repository, create a focused branch, and open a pull request explaining the problem and resulting behavior. Discuss larger renderer or architecture changes in an issue first.
+
+Contributors must write/update unit and acceptance tests, review their adequacy, and run them before submitting changes. Include the exact test commands/results and any manual game acceptance evidence in the pull request. Bug fixes should include a regression test; explain any checks you could not run. Do not submit game files, generated game code, captures, saves, or local configuration. Preserve upstream credits and license notices. Reviewers must inspect the tests and acceptance evidence before merge. See [CONTRIBUTING.md](CONTRIBUTING.md) and [TESTING.md](TESTING.md).
 
 ```powershell
 .\build.cmd -Action Test

@@ -52,3 +52,7 @@ Drag-and-drop launcher argument validation: real ISO hash check passed via posit
 The public runner passed 21 tests locally: 12 units (launch behavior and synthetic ISO parsing/verification) and 9 Windows launcher acceptance scenarios. Reviewed fixture isolation, assertions, failure propagation and timeouts. The CI workflow is configured but has not run remotely because publication remains pending approval. These checks do not replace game acceptance or hardware-dependent runtime tests.
 
 Toolchain-discovery regression: 23 public tests passed, including skipping a GCC-only installation and rejecting an explicit prefix missing CMake. A check-only invocation against the local ISO selected the complete project-local UCRT64 installation and verified the supported executable without generating/building the game.
+
+## Owner approval for publication
+
+On 2026-10-14 the owner confirmed that the corrected first-use build succeeded and authorized source publication after resetting local build/play outputs. This confirms the build workflow; it is not an additional full-campaign or gameplay-performance acceptance claim. The 23 public tests passed before this documentation-only update.
