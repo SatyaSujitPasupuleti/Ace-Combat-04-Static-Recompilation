@@ -17,7 +17,7 @@ The Python build tool uses only the standard library. No Ghidra installation is 
 
 ## Easy build and play
 
-Double-click **build.cmd** in the repository folder. It reuses saved paths on subsequent runs. On first use it detects `C:\msys64\ucrt64` or a toolchain on PATH (or asks for its location), finds Python, and opens an ISO file picker. It verifies the executable, generates code and builds a playable executable. Compilation can take several minutes. If anything fails, later stages stop and the terminal stays open so you can read the error.
+**Drag and drop one ISO onto `build.cmd`** in Explorer to select it and start building. Alternatively, double-click **build.cmd** to use the ISO picker. Dropped paths containing spaces are supported; the selected ISO path is remembered for future builds. Drop the ISO onto the script file, not onto an already-running terminal window. It reuses saved paths on subsequent runs. On first use it detects `C:\msys64\ucrt64` or a toolchain on PATH (or asks for its location), finds Python, and opens an ISO file picker. It verifies the executable, generates code and builds a playable executable. Compilation can take several minutes. If anything fails, later stages stop and the terminal stays open so you can read the error.
 
 Then double-click **play.cmd**. It supplies ISO/data/shader paths and the DLL search path automatically. It prefers a built native VU executable, otherwise bootstrap. The launchers support paths containing spaces and do not permanently change your system PATH or execution policy.
 

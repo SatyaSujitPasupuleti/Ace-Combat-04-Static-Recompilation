@@ -1,6 +1,7 @@
+[CmdletBinding(PositionalBinding=$false)]
 param(
     [ValidateSet('Build','Play','Optimize','Check')][string]$Action='Build',
-    [string]$Iso,
+    [Parameter(Position=0)][string]$Iso,
     [string]$Toolchain,
     [ValidateRange(1,64)][int]$Jobs=4,
     [ValidateSet('stream','memory')][string]$DiscCache='stream',

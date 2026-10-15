@@ -44,3 +44,5 @@ Existing compiler sign-comparison warnings and whitespace warnings in inherited/
 - Five Python launch-routing tests passed: bootstrap fallback, native preference, explicit missing-native rejection, capture directory/routing, and developer environment isolation.
 - Six isolated PowerShell orchestration cases passed using a stub helper: bootstrap build, captured-native build, optimization sequence, capture failure stopping before native build, preparation failure stopping before compilation, and play routing. The test repository path contained spaces.
 - ISO file-picker interaction is left for manual review. No runtime/game behavior changes were introduced by this launcher update.
+
+Drag-and-drop launcher argument validation: real ISO hash check passed via positional `.cmd` invocation. Isolated `.cmd` build-routing test passed with spaces in the repository/ISO paths and an ampersand in the ISO filename. Explorer mouse interaction itself remains a manual check.

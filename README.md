@@ -27,7 +27,7 @@ Read the [Windows build guide](docs/BUILD.md). The repository does not ship a ga
 
 After installing the prerequisites in the [build guide](docs/BUILD.md):
 
-1. Double-click **`build.cmd`**. It detects Python/MSYS2, asks you to select your ISO on first use, verifies the supported executable, generates the code and builds it.
+1. **Drag your ISO onto `build.cmd`**, or double-click **`build.cmd`** to choose it. It detects Python/MSYS2, asks you to select your ISO on first use, verifies the supported executable, generates the code and builds it.
 2. Double-click **`play.cmd`** to play. No terminal environment setup is needed.
 3. Optional: run `build.cmd -Action Optimize` to capture VU programs during a play session and compile them after you exit with Escape. Future builds reuse that local capture.
 
