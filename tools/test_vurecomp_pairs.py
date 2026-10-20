@@ -19,10 +19,12 @@ def main():
     for name, pairs in [
         ('load', [(load, add | 2 << 6 | 1 << 30), (lower_nop, nop)]),
         ('shared', [(load, add | 1 << 6 | 1 << 30), (lower_nop, nop)]),
-        ('end', [(0x10020007, nop | 1 << 30), (0x10030009, nop)])
+        ('end', [(0x10020007, nop | 1 << 30), (0x10030009, nop)]),
+        ('multi', [(lower_nop, nop | 1 << 30), (lower_nop, nop),
+                   (0x1004000b, nop | 1 << 30), (0x1005000d, nop)])
     ]:
         image = b''.join(struct.pack('<II', lo, up) for lo, up in pairs)
-        programs.append(emit_program(name, image.ljust(16384, b'\0'), [0], 0, len(image))[0])
+        programs.append(emit_program(name, image.ljust(16384, b'\0'), [0, 16] if name == 'multi' else [0], 0, len(image))[0])
     # Only arithmetic/storage helpers used by these tiny programs are needed.
     # Expectations below check externally visible results, not emitted strings.
     support = r'''
@@ -64,7 +66,14 @@ int main(void) {
     assert(v.vf[1].f[0]==10 && v.vi[1]==2);
     assert(vu1_prog_end(&v,0,10,&pc,&g,&s)==1);
     assert(v.vi[2]==7 && v.vi[3]==9 && pc==16 && g==2);
-    puts("PASS: pre-pair VF reads, shared-destination load suppression, E-bit lower op and delay slot");
+    assert(vu1_prog_multi(&v,0,10,&pc,&g,&s)==1);
+    assert(v.vi[4]==0 && v.vi[5]==0);
+    assert(vu1_prog_multi(&v,16,10,&pc,&g,&s)==1);
+    assert(v.vi[4]==11 && v.vi[5]==13 && pc==32 && g==2);
+    ps2_vu before=v;u32 saved_pc=pc,saved_g=g,saved_s=s;
+    assert(vu1_prog_multi(&v,8,10,&pc,&g,&s)==0);
+    assert(!memcmp(&before,&v,sizeof v) && pc==saved_pc && g==saved_g && s==saved_s);
+    puts("PASS: additional entries, non-mutating unknown entry, pre-pair VF reads, shared-destination load suppression, E-bit lower op and delay slot");
     return 0;
 }
 '''

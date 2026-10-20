@@ -10,3 +10,5 @@
 Ace Combat and the original game's code, art, music, text, and trademarks belong to their respective rights holders. The root source license does not grant rights to the original game. Supply your own supported ISO. No game download is provided.
 
 Fresh Git history is a packaging choice, not a claim that inherited code was independently written. Existing source-level notices and bundled dependency licenses are retained.
+
+- **PresidentRaptor / Ace Combat 04 PC Port**: https://github.com/PresidentRaptor/Ace-Combat-04-PC-Port - its Apache-2.0 renderer field-preservation and presentation synchronization fixes and technical notes informed our AC4 ordered-field handoff adaptation (2026-10-18). Our adaptation preserves pending draws across timed wait intervals and keeps the native mesh/HUD renderer.

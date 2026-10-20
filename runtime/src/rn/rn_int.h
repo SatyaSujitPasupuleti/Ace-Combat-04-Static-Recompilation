@@ -31,6 +31,24 @@ void rn_sun_init(void);
 int  rn_sun_claim_prim(const struct ps2_vk_state *st, int kind,
                        const struct ps2_vk_vertex *v, int n);
 
+extern int rn_ac4_sky_mesh_on;
+extern int rn_ac4_cloud_mesh_on;
+extern int rn_ac4_sprite_mesh_on;
+void rn_ac4_sprite_native_init(void);
+void rn_ac4_sprite_native_end(void);
+void rn_ac4_sprite_native_intent(const u8 *,u32);
+int rn_ac4_sprite_native_claim(const ps2_vk_state *,int,const ps2_vk_vertex *,int);
+void rn_ac4_sprite_native_report(void);
+void rn_ac4_cloud_native_init(void);
+void rn_ac4_cloud_native_end(void);
+void rn_ac4_cloud_native_intent(const u8 *,u32);
+int rn_ac4_cloud_native_claim(const ps2_vk_state *,int,const ps2_vk_vertex *,int);
+void rn_ac4_cloud_native_report(void);
+void rn_ac4_sky_native_init(void);
+void rn_ac4_sky_native_end(void);
+void rn_ac4_sky_native_intent(const u8 *,u32);
+int rn_ac4_sky_native_claim(const ps2_vk_state *,int,const ps2_vk_vertex *,int);
+void rn_ac4_sky_native_report(void);
 void rn_sky_init(void);
 void rn_sky_intent(const u8 *rec, u32 len);
 void rn_sky_end(void);

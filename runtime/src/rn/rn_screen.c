@@ -182,7 +182,7 @@ static void flush(void) {
             }
         }
     }
-    if (!ps2_vk_mesh_available()
+    if (!ps2_vk_mesh_room(nv, ni, 1)
         || ps2_vk_mesh_store(recs, nv, idx, ni, &vbase, &ifirst) != 0) {
         hand_back();
     } else {
@@ -206,6 +206,20 @@ static int claim(const struct ps2_vk_state *st, int kind,
 
 int rn_screen_claim_prim(const struct ps2_vk_state *st, int kind,
                          const struct ps2_vk_vertex *v, int n) {
+    if (PS2_GAME_AC4) {
+        /* Stage-one bridge: preserve GS shading and screen-space geometry.
+         * No AC5 emitter addresses or guest-layout assumptions apply here. */
+        if (!rn_screen_on || kind != RN_PRIM_TRI || n != 3 || !v || !st) return 0;
+        for (int i = 0; i < n; i++) {
+            const float c[4] = {v[i].r, v[i].g, v[i].b, v[i].a};
+            for (int j = 0; j < 4; j++)
+                /* The inherited mesh record stores integer colors. Preserve
+                 * fractional/clipped colors via the original GS path. */
+                if (!isfinite(c[j]) || c[j] < 0 || c[j] > 255 || floorf(c[j]) != c[j])
+                    return 0;
+        }
+        return claim(st, kind, v, n);
+    }
     if (!rn_screen_on || !is_screen_emitter(st->emitter)) return 0;
     if (rn_vu_kicking || rn_census_native_prog) return 0;
     st_by_site[st->emitter < RN_EMIT_MAX ? site_of[st->emitter] : 0]++;
@@ -251,8 +265,10 @@ static int claim(const struct ps2_vk_state *st, int kind,
 }
 
 void rn_screen_init(void) {
-    const char *e = getenv("PS2_RN_SCREEN");
-    rn_screen_on = !(e && *e == '0');
+    const char *e = getenv(PS2_GAME_AC4 ? "PS2_AC4_MESH_BRIDGE" : "PS2_RN_SCREEN");
+    rn_screen_on = PS2_GAME_AC4 ? (e && !strcmp(e, "triangles")) : !(e && *e == '0');
+    if (PS2_GAME_AC4 && rn_screen_on)
+        ps2_log("rn: experimental AC4 triangle mesh bridge (VU/GIF retained; GS fallback)");
     if (rn_screen_on) ps2_vk_before_record = before_record;
 }
 

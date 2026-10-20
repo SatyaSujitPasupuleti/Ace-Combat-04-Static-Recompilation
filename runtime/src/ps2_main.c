@@ -262,6 +262,10 @@ void ps2_finish(const char *why) {
     ps2_host_prof_report();
     ps2_prof_report(30);
     ps2_dump_trace("run summary");
+    /* Bounded runs finish via _exit rather than main's normal cleanup.
+     * Join the worker before flushing optional deferred field diagnostics. */
+    { const char *timeline=getenv("PS2_GFX_TIMELINE");
+      if(timeline && *timeline)ps2_gfxq_shutdown(); }
     if (video_active) {
         ps2_video_shutdown();
         ps2_vk_screenshot("ps2_frame.ppm");

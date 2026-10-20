@@ -75,6 +75,8 @@ set(RUNTIME_SOURCES
     runtime/src/ps2_lua.c
     runtime/src/ps2_ui.cpp
     runtime/src/rn/rn_census.c
+    runtime/src/rn/rn_ac4_mesh.c
+    runtime/src/rn/rn_ac4_model.c
     runtime/src/rn/rn_2d.c
     runtime/src/rn/rn_dump.c
     runtime/src/rn/rn_vp.c
@@ -135,6 +137,10 @@ set_source_files_properties(${GENERATED_SOURCES} PROPERTIES
 
 set(HOT_SOURCES runtime/src/ps2_vu.c runtime/src/ps2_gs.c runtime/src/ps2_hw.c)
 set_source_files_properties(${HOT_SOURCES} PROPERTIES COMPILE_OPTIONS "-O3")
+# Preserve explicit arithmetic steps; host FMA is not a VU FMAC model.
+set_property(SOURCE runtime/src/ps2_vu.c runtime/src/ps2_core.c
+    runtime/src/rn/rn_ac4_model.c
+    APPEND PROPERTY COMPILE_OPTIONS "-ffp-contract=off")
 
 if(PS2_DIAG)
   target_compile_definitions(ac4 PRIVATE PS2_DIAG=1)

@@ -100,6 +100,12 @@ void ps2_audio_start(void) {
         ps2_log("audio: SDL_OpenAudioDeviceStream: %s", SDL_GetError());
         return;
     }
+    const char *mute=getenv("PS2_AUDIO_MUTE");
+    if(mute && atoi(mute)!=0) {
+        if(SDL_SetAudioStreamGain(audio_stream,0.0f))
+            ps2_log("audio: playback muted; mixer and stream timing remain active");
+        else ps2_log("audio: could not mute playback: %s",SDL_GetError());
+    }
     wav_open();
     SDL_ResumeAudioStreamDevice(audio_stream);
     audio_started = 1;

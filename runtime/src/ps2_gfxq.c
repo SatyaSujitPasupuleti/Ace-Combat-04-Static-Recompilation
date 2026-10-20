@@ -6,6 +6,12 @@
 #include <string.h>
 #include <pthread.h>
 #include <time.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 void ps2_vif_transfer(int which, const ps2_reg128 *q, u32 qwc);
 void ps2_vif_write(int which, u32 word);
@@ -30,7 +36,8 @@ enum {
     GQ_MMIO,
     GQ_FIELD,
     GQ_TAG,
-    GQ_INTENT
+    GQ_INTENT,
+    GQ_FIELD_TRACE
 };
 
 static u8 *q_buf;
@@ -43,12 +50,16 @@ static _Thread_local int q_is_worker;
 static pthread_mutex_t q_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t q_not_empty = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t q_not_full  = PTHREAD_COND_INITIALIZER;
+/* Ring progress does not complete a field. Keep field-depth waiters asleep
+ * until the worker reaches a field marker instead of waking every batch. */
+static pthread_cond_t q_field_ready = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t q_idle      = PTHREAD_COND_INITIALIZER;
 
 static u64 st_records, st_bytes, st_producer_waits, st_drains, st_drain_waits;
 static size_t st_peak_fill;
 static int q_fields_pending;
 static int q_field_depth = 2;
+static int q_split_field_wait=1;
 static u64 st_field_waits;
 static u64 st_field_wait_ns;
 
@@ -57,6 +68,95 @@ static u64 gq_now_ns(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
 }
+/* Optional field diagnostics. No file IO or per-packet clocks on the hot
+ * path; timestamps distinguish producer gaps, queue backlog, CPU and idle.
+ * Rows are written only after worker shutdown by the ordinary report path. */
+#define GQ_TRACE_MAX 32768u
+static struct {
+    u64 field,ready,cpu,queued,worker,worker_cpu,idle,previous_present,bytes,producer_tid,cycles,lock,apply,notify;
+} q_trace_rows[GQ_TRACE_MAX];
+/* Optional packet clocks, only when explicitly requested with field tracing.
+ * Accumulate in memory; no packet logging or IO in the worker. */
+static struct { u64 ns[12],count[12],max_ns[12],max_bytes[12]; } q_jobs[GQ_TRACE_MAX];
+static int q_jobs_on;
+static u32 q_trace_n;
+static u64 q_trace_dropped,q_trace_idle,q_trace_previous_present;
+static u64 q_trace_lock,q_trace_apply,q_trace_notify;
+static int q_trace_on;
+static const char *q_trace_path;
+static u64 q_cpu_ns(void) {
+#ifdef _WIN32
+    FILETIME created,exited,kernel,user;
+    if(GetThreadTimes(GetCurrentThread(),&created,&exited,&kernel,&user))
+        return (((u64)kernel.dwHighDateTime<<32)+kernel.dwLowDateTime
+              +((u64)user.dwHighDateTime<<32)+user.dwLowDateTime)*100ull;
+#endif
+    return 0;
+}
+static u64 q_cpu_cycles(void) {
+#ifdef _WIN32
+    ULONG64 cycles=0;
+    if(QueryThreadCycleTime(GetCurrentThread(),&cycles))return (u64)cycles;
+#endif
+    return 0;
+}
+static u64 q_thread_id(void) {
+#ifdef _WIN32
+    return GetCurrentThreadId();
+#else
+    return 0;
+#endif
+}
+static void q_trace_capture(const u8 *r,size_t tail) {
+    if(q_trace_n>=GQ_TRACE_MAX){q_trace_dropped++;return;}
+    u32 i=q_trace_n++;
+    q_trace_rows[i].field=(u64)i+1;
+    memcpy(&q_trace_rows[i].ready,r+1,8);
+    memcpy(&q_trace_rows[i].cpu,r+9,8);
+    memcpy(&q_trace_rows[i].queued,r+17,8);
+    memcpy(&q_trace_rows[i].producer_tid,r+25,8);
+    q_trace_rows[i].worker=gq_now_ns();
+    q_trace_rows[i].worker_cpu=q_cpu_ns();
+    q_trace_rows[i].cycles=q_cpu_cycles();
+    q_trace_rows[i].lock=q_trace_lock;
+    q_trace_rows[i].apply=q_trace_apply;
+    q_trace_rows[i].notify=q_trace_notify;
+    q_trace_rows[i].idle=q_trace_idle;
+    q_trace_rows[i].previous_present=q_trace_previous_present;
+    q_trace_rows[i].bytes=__atomic_load_n(&q_head,__ATOMIC_ACQUIRE)-tail;
+}
+static void q_trace_report(void) {
+    if(!q_trace_on)return;
+    FILE *f=fopen(q_trace_path,"w");
+    if(!f){ps2_log("gfx timeline: cannot write %s",q_trace_path);return;}
+    fprintf(f,"field,producer_ready_ns,producer_cpu_ns,queued_ns,worker_ready_ns,worker_cpu_ns,worker_idle_ns,previous_present_ns,queue_bytes,producer_tid,worker_cycles,worker_lock_ns,worker_apply_ns,worker_notify_ns\n");
+    for(u32 i=0;i<q_trace_n;i++) {
+        const u64 v[14]={q_trace_rows[i].field,q_trace_rows[i].ready,q_trace_rows[i].cpu,
+            q_trace_rows[i].queued,q_trace_rows[i].worker,q_trace_rows[i].worker_cpu,
+            q_trace_rows[i].idle,q_trace_rows[i].previous_present,q_trace_rows[i].bytes,q_trace_rows[i].producer_tid,
+            q_trace_rows[i].cycles,q_trace_rows[i].lock,q_trace_rows[i].apply,q_trace_rows[i].notify};
+        for(u32 k=0;k<14;k++)fprintf(f,k?",%llu":"%llu",(unsigned long long)v[k]);
+        fputc('\n',f);
+    }
+    fclose(f);
+    if(q_jobs_on) {
+        char path[4096];
+        if(snprintf(path,sizeof(path),"%s.jobs.csv",q_trace_path)<(int)sizeof(path)) {
+            f=fopen(path,"w");
+            if(f) {
+                fprintf(f,"field,opcode,count,total_ns,max_ns,max_bytes\n");
+                for(u32 i=0;i<q_trace_n;i++)for(u32 op=1;op<12;op++)
+                    if(q_jobs[i].count[op])fprintf(f,"%u,%u,%llu,%llu,%llu,%llu\n",i+1,op,
+                        (unsigned long long)q_jobs[i].count[op],(unsigned long long)q_jobs[i].ns[op],
+                        (unsigned long long)q_jobs[i].max_ns[op],(unsigned long long)q_jobs[i].max_bytes[op]);
+                fclose(f);
+            } else ps2_log("gfx jobs: cannot write %s",path);
+        }
+    }
+    ps2_log("gfx timeline: %u fields, %llu overflow rows; %s",q_trace_n,
+        (unsigned long long)q_trace_dropped,q_trace_path);
+}
+
 static u64 st_producer_ns, st_drain_ns;
 
 static u64 speed_present_ns, speed_present_n, speed_work_ns;
@@ -186,8 +286,9 @@ static u32 q_apply(const u8 *r) {
         return 5u + len;
     }
     case GQ_FIELD:
+    case GQ_FIELD_TRACE:
         if (!ps2_gs_present_now()) ps2_request_exit();
-        return 1u;
+        return r[0]==GQ_FIELD_TRACE ? 33u : 1u;
     default:
         ps2_log("gfxq: corrupt record opcode %u -- stopping the worker", r[0]);
         return 0u;
@@ -207,7 +308,9 @@ static void *q_main(void *unused) {
             __atomic_store_n(&q_busy, 0, __ATOMIC_SEQ_CST);
             pthread_cond_broadcast(&q_idle);
             if (__atomic_load_n(&q_head, __ATOMIC_SEQ_CST) != q_tail) break;
+            u64 idle_start=q_trace_on?gq_now_ns():0;
             pthread_cond_wait(&q_not_empty, &q_lock);
+            if(q_trace_on)q_trace_idle+=gq_now_ns()-idle_start;
         }
         if (!q_running && __atomic_load_n(&q_head, __ATOMIC_SEQ_CST) == q_tail) break;
         __atomic_store_n(&q_busy, 1, __ATOMIC_SEQ_CST);
@@ -217,25 +320,47 @@ static void *q_main(void *unused) {
         int field = 0, corrupt = 0;
         u64 speed_elapsed = 0;
         pthread_mutex_unlock(&q_lock);
+        u64 batch_start=q_trace_on?gq_now_ns():0;
         while (tail != head && records < 256) {
             const u8 *r = q_buf + (tail & (q_cap - 1));
             if (*r == GQ_WRAP) {
                 tail += q_cap - (tail & (q_cap - 1));
                 continue;
             }
-            field = *r == GQ_FIELD;
-            u64 start = field && speed_on ? gq_now_ns() : 0;
+            field = *r == GQ_FIELD || *r == GQ_FIELD_TRACE;
+            if(*r==GQ_FIELD_TRACE) {
+                u64 now=gq_now_ns();q_trace_apply+=now-batch_start;batch_start=now;
+                q_trace_capture(r,tail);
+            }
+            u64 start = field && (speed_on || q_trace_on) ? gq_now_ns() : 0;
+            u64 job_row=(u64)q_trace_n+q_trace_dropped;
+            if(field && job_row)job_row--;
+            u32 job_op=*r;
+            u64 job_start=q_jobs_on && job_row<GQ_TRACE_MAX ? gq_now_ns():0;
             u32 n;
             { PS2_PHASE_BEGIN(PS2_PH_GFXQ);
               n = q_apply(r);
               PS2_PHASE_END(PS2_PH_GFXQ); }
-            if (start) speed_elapsed = gq_now_ns() - start;
+            if(job_start && job_op<12) {
+                u64 elapsed=gq_now_ns()-job_start;
+                q_jobs[job_row].count[job_op]++;q_jobs[job_row].ns[job_op]+=elapsed;
+                if(elapsed>q_jobs[job_row].max_ns[job_op]) {
+                    q_jobs[job_row].max_ns[job_op]=elapsed;q_jobs[job_row].max_bytes[job_op]=n;
+                }
+            }
+            if (start) {
+                speed_elapsed = gq_now_ns() - start;
+                if(q_trace_on)q_trace_previous_present=speed_elapsed;
+            }
             if (!n) { corrupt = 1; break; }
             tail += n;
             records++;
             if (field) break;
         }
+        u64 lock_start=0;
+        if(q_trace_on) {lock_start=gq_now_ns();q_trace_apply+=lock_start-batch_start;}
         pthread_mutex_lock(&q_lock);
+        if(q_trace_on)q_trace_lock+=gq_now_ns()-lock_start;
         __atomic_store_n(&q_tail, tail, __ATOMIC_RELEASE);
         if (field && !corrupt) {
             if (speed_on) {
@@ -245,7 +370,10 @@ static void *q_main(void *unused) {
             if (speed_burst) { u64 now=gq_now_ns(); speed_work_ns+=now-speed_burst; speed_burst=now; }
             q_fields_pending--;
         }
+        u64 notify_start=q_trace_on?gq_now_ns():0;
         pthread_cond_broadcast(&q_not_full);
+        if(q_split_field_wait && (field || corrupt))pthread_cond_broadcast(&q_field_ready);
+        if(q_trace_on)q_trace_notify+=gq_now_ns()-notify_start;
         if (corrupt) { q_running = 0; break; }
     }
     __atomic_store_n(&q_busy, 0, __ATOMIC_SEQ_CST);
@@ -285,6 +413,13 @@ void ps2_gfxq_init(void) {
                 q_cap >> 20);
         return;
     }
+    q_trace_path=getenv("PS2_GFX_TIMELINE");
+    q_trace_on=q_trace_path && *q_trace_path;
+    {const char *jobs=getenv("PS2_GFX_JOB_TIMING");q_jobs_on=q_trace_on && jobs && atoi(jobs)!=0;}
+    if(q_jobs_on)memset(q_jobs,0,sizeof(q_jobs));
+    q_trace_n=0;q_trace_dropped=q_trace_idle=q_trace_previous_present=0;
+    q_trace_lock=q_trace_apply=q_trace_notify=0;
+    {const char *legacy=getenv("PS2_GFX_FIELD_WAKE_LEGACY");q_split_field_wait=!(legacy && atoi(legacy)!=0);}
     q_head = q_tail = q_producer_tail = q_reserved_end = 0;
     q_running = 1;
     if (pthread_create(&q_thread, NULL, q_main, NULL) != 0) {
@@ -324,6 +459,7 @@ void ps2_gfxq_shutdown(void) {
     pthread_cond_broadcast(&q_not_empty);
     pthread_mutex_unlock(&q_lock);
     pthread_join(q_thread, NULL);
+    q_trace_report();
     ps2_gfxq_on = 0;
 }
 
@@ -412,6 +548,8 @@ void ps2_gfxq_gs_priv(u32 addr, u64 val) {
 }
 
 int ps2_gfxq_field(void) {
+    u64 producer_ready=q_trace_on?gq_now_ns():0;
+    u64 producer_cpu=q_trace_on?q_cpu_ns():0;
     if (!ps2_gfxq_on) {
         u64 start = ps2_speed_enabled() ? gq_now_ns() : 0;
         int result = ps2_gs_present_now();
@@ -426,14 +564,18 @@ int ps2_gfxq_field(void) {
         u64 t0 = gq_now_ns();
         st_field_waits++;
         while (q_running && q_fields_pending >= q_field_depth)
-            pthread_cond_wait(&q_not_full, &q_lock);
+            pthread_cond_wait(q_split_field_wait?&q_field_ready:&q_not_full, &q_lock);
         st_field_wait_ns += gq_now_ns() - t0;
     }
     q_fields_pending++;
     pthread_mutex_unlock(&q_lock);
-    { u8 *r = q_reserve(1);
-      put8(r, 0, GQ_FIELD);
-      q_commit(1); }
+    { u32 size=q_trace_on?33u:1u;
+      u8 *r = q_reserve(size);
+      put8(r, 0, q_trace_on?GQ_FIELD_TRACE:GQ_FIELD);
+      if(q_trace_on) {
+          put64(r,1,producer_ready);put64(r,9,producer_cpu);put64(r,17,gq_now_ns());put64(r,25,q_thread_id());
+      }
+      q_commit(size); }
     return 1;
 }
 

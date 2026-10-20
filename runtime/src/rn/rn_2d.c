@@ -1,4 +1,6 @@
 #include "rn_int.h"
+#include "rn_ac4_model.h"
+#include "rn_ac4_mesh.h"
 #include "ps2_settings.h"
 
 #include <math.h>
@@ -28,7 +30,7 @@ static struct {
 enum { REJ_NONE = 0, REJ_TARGET, REJ_TEXRT, REJ_ZWRITE, REJ_DATE, REJ_DSTALPHA,
        REJ_COLCLIP, REJ_MASK, REJ_N };
 static const char *rej_name[REJ_N] = {
-    "accepted", "not slot 0", "reads a render target", "writes Z",
+    "accepted", "not scene target", "reads a render target", "writes Z",
     "destination alpha test", "blend uses destination alpha", "wrapping blend",
     "partial frame mask" };
 
@@ -39,7 +41,7 @@ static struct {
 } st2d;
 
 static int reject_reason(const ps2_vk_state *st) {
-    if (st->rt != 0u) return REJ_TARGET;
+    if (st->rt != PS2_VK_2D_SCENE_RT) return REJ_TARGET;
     if (st->tex_rt) return REJ_TEXRT;
     if (st->zwrite && st->zte) return REJ_ZWRITE;
     if (st->date) return REJ_DATE;
@@ -71,7 +73,7 @@ static void reanchor(void) {
     if (!(ps2_vk_display_aspect > 1.34f)) return;
     for (u32 i = 0; i < el.n; i++) {
         const held_prim *h = &el.held[i];
-        if (h->st.rt != 0u) continue;
+        if (h->st.rt != PS2_VK_2D_SCENE_RT) continue;
         if (h->st.fb_w > fbw) fbw = h->st.fb_w;
         for (int k = 0; k < h->n; k++) {
             if (h->v[k].x < x0) x0 = h->v[k].x;
@@ -84,7 +86,7 @@ static void reanchor(void) {
     cx = gx + 0.5f;
     for (u32 i = 0; i < el.n; i++) {
         held_prim *h = &el.held[i];
-        if (h->st.rt != 0u) continue;
+        if (h->st.rt != PS2_VK_2D_SCENE_RT) continue;
         if (h->st.tex_point) h->st.tex_point = 2;
         for (int k = 0; k < h->n; k++) {
             h->v[k].x = cx + (h->v[k].x - cx) * s;
@@ -163,6 +165,12 @@ static int claim_2d(const struct ps2_vk_state *st, int kind,
     h->kind = kind;
     h->n = n > 6 ? 6 : n;
     memcpy(h->v, v, sizeof(ps2_vk_vertex) * (size_t)h->n);
+    if(PS2_GAME_AC4) {
+        static int budget=-1;
+        if(budget<0){const char *e=getenv("PS2_AC4_SCREEN_STATE_LOG");budget=e?atoi(e):0;if(budget<0)budget=0;if(budget>64)budget=64;}
+        if(budget>0){budget--;ps2_log("ac4 screen target: site=%08x rt=%u texrt=%u size=%ux%u zte=%u zwrite=%u date=%u mask=%08x",
+            el.site,st->rt,st->tex_rt,st->fb_w,st->fb_h,st->zte,st->zwrite,st->date,st->fb_mask);}
+    }
     h->reject = reject_reason(st);
     if (el.reject == REJ_NONE) el.reject = h->reject;
     st2d.prims++;
@@ -215,6 +223,14 @@ static int claim_frontend(const struct ps2_vk_state *st, int kind,
 
 int rn_claim_prim_slow(const struct ps2_vk_state *st, int kind,
                        const struct ps2_vk_vertex *v, int n) {
+    if (PS2_GAME_AC4) {
+        if (on_2d && el.active) return claim_2d(st,kind,v,n);
+        if (rn_ac4_sky_mesh_on && rn_ac4_sky_native_claim(st,kind,v,n)) return 1;
+        if (rn_ac4_cloud_mesh_on && rn_ac4_cloud_native_claim(st,kind,v,n)) return 1;
+        if (rn_ac4_sprite_mesh_on && rn_ac4_sprite_native_claim(st,kind,v,n)) return 1;
+        if (rn_ac4_model_mesh_on && rn_ac4_mesh_claim(st,kind,v,n)) return 1;
+        return rn_screen_claim_prim(st,kind,v,n);
+    }
     if (el.active) return claim_2d(st, kind, v, n);
     if (rn_sky_active()) return rn_sky_claim_prim(st, kind, v, n);
     if (rn_tri3d_active()) return rn_tri3d_claim_prim(st, kind, v, n);
@@ -261,6 +277,16 @@ void rn_gs_intent(const u8 *rec, u32 len) {
         el.n = 0;
         el.reject = REJ_NONE;
         break;
+    case RN_INT_AC4_SKY:
+    case RN_INT_AC4_HAZE:
+        rn_ac4_sky_native_intent(rec,len);
+        break;
+    case RN_INT_AC4_CLOUD:
+        rn_ac4_cloud_native_intent(rec,len);
+        break;
+    case RN_INT_AC4_SPRITE:
+        rn_ac4_sprite_native_intent(rec,len);
+        break;
     case RN_INT_SKYDOME:
         if (el.active) { st2d.unclosed++; element_end(); }
         rn_sky_intent(rec, len);
@@ -278,6 +304,9 @@ void rn_gs_intent(const u8 *rec, u32 len) {
         rn_billboard_intent(rec, len);
         break;
     case RN_INT_CLAIM_END:
+        rn_ac4_sky_native_end();
+        rn_ac4_cloud_native_end();
+        rn_ac4_sprite_native_end();
         element_end();
         rn_sky_end();
         rn_tri3d_end();
@@ -291,7 +320,17 @@ void rn_gs_intent(const u8 *rec, u32 len) {
 
 void rn_claims_init(void) {
     /* AC5 guest layouts and vector-program replacements are unverified for AC4. */
-    if (PS2_GAME_AC4) return;
+    if (PS2_GAME_AC4) {
+        const char *screen=getenv("PS2_AC4_SCREEN_2D");
+        on_2d=screen && !strcmp(screen,"1");
+        rn_ac4_sky_native_init();
+        rn_ac4_cloud_native_init();
+        rn_ac4_sprite_native_init();
+        rn_ac4_model_init();
+        rn_screen_init();
+        rn_claims_on = on_2d || rn_screen_on || rn_ac4_model_mesh_on || rn_ac4_sky_mesh_on || rn_ac4_cloud_mesh_on || rn_ac4_sprite_mesh_on;
+        return;
+    }
     static int done;
     const char *e = getenv("PS2_RN_2D");
     if (done) return;

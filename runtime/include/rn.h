@@ -33,6 +33,7 @@ enum {
 void rn_init(void);
 
 extern int rn_taps_on;
+extern int rn_ac4_sprite_mesh_on;
 
 void rn_dma_attrib_slow(int ch, u32 tadr);
 static inline void rn_dma_attrib(int ch, u32 tadr) {
@@ -111,7 +112,11 @@ enum {
     RN_INT_SKYDOME   = 4,
     RN_INT_TRI3D     = 5,
     RN_INT_BILLBOARD = 6,
-    RN_INT_WORLDTRI  = 7
+    RN_INT_WORLDTRI  = 7,
+    RN_INT_AC4_SKY   = 8,
+    RN_INT_AC4_HAZE  = 9,
+    RN_INT_AC4_CLOUD = 10,
+    RN_INT_AC4_SPRITE = 11
 };
 
 #define RN_G_WORLD 1u
@@ -188,6 +193,7 @@ void rn_gs_intent(const u8 *rec, u32 len);
 
 extern int rn_intents_pending;
 void rn_dma_transfer_slow(int ch, u32 madr, u32 qwc, int after);
+u32 rn_dma_chunk_limit(u32 madr,u32 qwc);
 static inline void rn_dma_transfer(int ch, u32 madr, u32 qwc, int after) {
     if (rn_intents_pending) rn_dma_transfer_slow(ch, madr, qwc, after);
 }

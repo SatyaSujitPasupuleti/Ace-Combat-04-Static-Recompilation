@@ -1,5 +1,5 @@
 /* Renderer state combinations observed in the AC4 opening, aircraft room,
- * and Mission 1 regression tests. These are device-independent Vulkan
+ * and Mission 1/2 regression tests. These are device-independent Vulkan
  * pipeline keys, not shader binaries or game assets. Extend as new states
  * are validated; unknown states still compile on demand. */
 #ifndef AC4_PIPELINE_STATES_H
@@ -79,5 +79,27 @@ static const u64 ac4_pipeline_states[] = {
     0x000002000168001Eull,
     0x0000020001A80019ull,
     0x0000020001A9001Eull,
+    0x0000010001440011ull,
+    0x0000010001480011ull,
+    0x0000020001440011ull,
+    0x0000020001480011ull,
+    0x0000020001640011ull,
+    0x000102000048001Dull,
+    0x000102000064001Dull,
+    0x000102000144001Aull,
+    0x000102000144001Bull,
+    0x000102000144011Aull,
+    0x000102000164011Bull,
+    0x000302000044001Eull,
+    0x000302000044001Full,
+    0x000302000064011Full,
+    0x0003020001440019ull,
+    0x000302000144001Eull,
+    0x000302000144001Full,
+    0x000302000158001Aull,
+    0x000302000158001Eull,
+    0x000302000168001Aull,
+    0x000302000168001Eull,
+    0x000302000144001Aull,
 };
 #endif

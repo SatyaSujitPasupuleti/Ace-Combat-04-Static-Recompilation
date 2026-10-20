@@ -19,6 +19,29 @@ def load(manifest_dir):
     return man
 
 
+def merge(manifests):
+    """Keep earlier scene coverage when adding a later microcode census."""
+    programs = {}
+    for manifest in manifests:
+        for incoming in manifest["programs"]:
+            crc = incoming["crc"]
+            if crc not in programs:
+                programs[crc] = dict(incoming, entries=[dict(e) for e in incoming["entries"]])
+                continue
+            p = programs[crc]
+            if p["bytes_"] != incoming["bytes_"]:
+                raise ValueError("Conflicting microcode images for %s" % crc)
+            p["code_lo"] = min(p["code_lo"], incoming["code_lo"])
+            p["code_hi"] = max(p["code_hi"], incoming["code_hi"])
+            for key in ("activations", "instructions", "xgkicks"):
+                p[key] = p.get(key, 0) + incoming.get(key, 0)
+            entries = {e["pc"]: e["count"] for e in p["entries"]}
+            for e in incoming["entries"]:
+                entries[e["pc"]] = entries.get(e["pc"], 0) + e["count"]
+            p["entries"] = [dict(pc=pc, count=count) for pc, count in sorted(entries.items())]
+    return {"programs": list(programs.values())}
+
+
 def decode_check(man):
     up_bad = collections.Counter()
     lo_bad = collections.Counter()
@@ -164,6 +187,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="vurecomp")
     ap.add_argument("--programs", default="out/vu_programs",
                     help="directory holding manifest.json (default %(default)s)")
+    ap.add_argument("--extra-programs", action="append", default=[], metavar="DIR",
+                    help="merge another census without losing earlier scene coverage (repeatable)")
     ap.add_argument("--decode-check", action="store_true")
     ap.add_argument("--stats", action="store_true")
     ap.add_argument("-o", "--output", metavar="FILE",
@@ -175,7 +200,7 @@ def main(argv=None):
             "No census at %s/manifest.json.\n"
             "Record one by running the game with PS2_VU_CENSUS=1 set."
             % args.programs)
-    man = load(args.programs)
+    man = merge([load(args.programs)] + [load(d) for d in args.extra_programs])
 
     rc = 0
     if args.decode_check:
