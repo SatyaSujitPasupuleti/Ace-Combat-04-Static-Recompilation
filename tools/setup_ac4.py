@@ -88,8 +88,20 @@ def build(cfg, native, jobs):
     call([prefix / 'cmake.exe', '--build', build_dir, '--target', 'ac4', '-j', jobs], env)
 
 
-def run(cfg, capture, memory, renderer='auto'):
+def run(cfg, capture, memory, renderer='auto', mesh_bridge='off', model_audit=False, model_mesh=False, model_materials=False, model_textures=False, native_unlit=False, native_lit=False, hybrid_renderer=False, full_output_resolution=False, vu_execution="native"):
     env = environment(cfg)
+    hybrid = hybrid_renderer and not capture
+    if not capture and vu_execution == 'aot' and not hybrid:
+        raise ValueError('AOT VU comparison requires --hybrid-renderer.')
+    if full_output_resolution and not capture and not hybrid:
+        raise ValueError("Full output resolution requires --hybrid-renderer.")
+    if hybrid:
+        if renderer == 'bootstrap':
+            raise ValueError('Hybrid renderer requires the native build; remove --renderer bootstrap.')
+        if mesh_bridge != 'off':
+            raise ValueError('Hybrid renderer uses native meshes; do not combine it with --mesh-bridge.')
+        renderer = 'native'
+        model_mesh = model_materials = model_textures = native_unlit = native_lit = True
     (ROOT / 'saves').mkdir(exist_ok=True)
     native = not capture and renderer != 'bootstrap' and (
         renderer == 'native' or (ROOT / 'build/native-poc/ac4.exe').is_file())
@@ -102,8 +114,30 @@ def run(cfg, capture, memory, renderer='auto'):
                PS2_VU_RECOMP='1' if native else '0', PS2_FPS_CAP='60',
                PS2_AC4_OPENING='Show', PS2_PRESENT_QUEUE='1',
                PS2_T4_PARTIAL='1', PS2_T4_SOURCE_HASH='1',
-               PS2_PIPELINE_PREWARM='1', PS2_IMAGE_PREWARM='15',
+               PS2_DROP_FIELDS='0', PS2_PIPELINE_PREWARM='1', PS2_IMAGE_PREWARM='15',
                PS2_SNAPSHOT_PREWARM='8', PS2_RT_RESERVE_HEIGHT='896', PS2_SHOT_EVERY='0')
+    env['PS2_AC4_MESH_BRIDGE'] = mesh_bridge if not capture else 'off'
+    env['PS2_AC4_MODEL_AUDIT'] = '1' if model_audit and not capture else '0'
+    env['PS2_AC4_MODEL_MESH'] = '1' if (model_mesh or model_materials or model_textures or native_unlit or native_lit) and not capture else '0'
+    env['PS2_AC4_MODEL_MATERIAL'] = '1' if (model_materials or model_textures) and not capture else '0'
+    env['PS2_AC4_TERRAIN_NATIVE'] = '0'  # Experimental replay-only VU bypass.
+    env['PS2_AC4_TERRAIN_MESH'] = '0'  # Capture-only prototype pending broader terrain acceptance.
+    env['PS2_AC4_LIT_NATIVE'] = '1' if native_lit and not capture else '0'
+    env['PS2_AC4_MODEL_NATIVE'] = '1' if native_unlit and not capture else '0'
+    env['PS2_AC4_MODEL_TEXTURE'] = '1' if model_textures and not capture else '0'
+    if hybrid:
+        for feature in ('TERRAIN_NATIVE', 'TERRAIN_MESH', 'COCKPIT_NATIVE', 'COCKPIT_MESH', 'SKY_MESH', 'CLOUD_MESH',
+                        'SPRITE_MESH', 'SKY_BAND_NATIVE', 'ROW_NATIVE', 'SCREEN_2D',
+                        'SCREEN_PRECOMPOSE', 'SCREEN_MASK', 'HUD_GROUP_NATIVE', 'SUPPLIED_MIPS'):
+            env['PS2_AC4_' + feature] = '1'
+        env.update(PS2_AC4_SUPPLIED_FILTER='2', PS2_RN_2D_OVERLAY='1', PS2_RN_2D_SCALE='0')
+        env['PS2_AC4_FULL_OUTPUT_RES'] = '1'
+        print('Full output coverage: Auto scales for width and height; increased GPU cost.', flush=True)
+        print('Experimental hybrid renderer: native meshes, mip filtering and window-resolution HUD; GS fallback retained.', flush=True)
+    if hybrid and vu_execution == 'aot':
+        for feature in ('MODEL_NATIVE', 'LIT_NATIVE', 'TERRAIN_NATIVE', 'COCKPIT_NATIVE'):
+            env['PS2_AC4_' + feature] = '0'
+        print('Experimental AOT VU execution: native GPU paths retained; CPU VU replacements disabled.', flush=True)
     if capture:
         (ROOT / 'out/vu_programs').mkdir(parents=True, exist_ok=True)
         env['PS2_VU_CENSUS'] = '1'
@@ -123,6 +157,17 @@ def main():
     ap.add_argument('--jobs', type=int, default=4)
     ap.add_argument('--disc-cache', choices=['stream', 'memory'], default='stream')
     ap.add_argument('--renderer', choices=['auto', 'bootstrap', 'native'], default='auto')
+    ap.add_argument('--vu-execution', choices=['native', 'aot'], default='native',
+                    help='CPU VU policy: native replacements with AOT fallback (default), or experimental AOT with hybrid GPU paths retained')
+    ap.add_argument('--mesh-bridge', choices=['off', 'triangles'], default='off')
+    ap.add_argument('--model-audit', action='store_true', help='Compare native AC4 model calculations without replacing draws')
+    ap.add_argument('--full-output-resolution', action='store_true', help='Compatibility switch: hybrid mode now covers both window dimensions by default; higher GPU cost')
+    ap.add_argument('--hybrid-renderer', action='store_true', help='Experimental combined native renderer; requires native build, disabled for captures')
+    ap.add_argument('--model-mesh', action='store_true', help='Experimental GPU model transforms; VU/GIF reference retained')
+    ap.add_argument('--native-lit', action='store_true', help='Experimental native execution of supported lit models; implies native unlit and meshes')
+    ap.add_argument('--native-unlit', action='store_true', help='Experimental native execution of supported unlit models; implies model meshes')
+    ap.add_argument('--model-textures', action='store_true', help='Experimental native mip textures; implies model materials and meshes')
+    ap.add_argument('--model-materials', action='store_true', help='Experimental native model materials; implies model-mesh')
     args = ap.parse_args()
     if args.jobs < 1:
         ap.error('--jobs must be positive')
@@ -151,7 +196,7 @@ def main():
     if args.action in ('build', 'build-native'):
         build(cfg, args.action == 'build-native', args.jobs)
     else:
-        run(cfg, args.action == 'capture-vu', args.disc_cache == 'memory', args.renderer)
+        run(cfg, args.action == 'capture-vu', args.disc_cache == 'memory', args.renderer, args.mesh_bridge, args.model_audit, args.model_mesh, args.model_materials, args.model_textures, args.native_unlit, args.native_lit, args.hybrid_renderer, args.full_output_resolution, args.vu_execution)
 
 
 if __name__ == '__main__':

@@ -5,6 +5,16 @@ param(
     [string]$Toolchain,
     [ValidateRange(1,64)][int]$Jobs=4,
     [ValidateSet('stream','memory')][string]$DiscCache='stream',
+    [ValidateSet('off','triangles')][string]$MeshBridge='off',
+    [switch]$ModelAudit,
+    [switch]$ModelMesh,
+    [switch]$ModelMaterials,
+    [switch]$ModelTextures,
+    [switch]$NativeUnlit,
+    [switch]$NativeLit,
+    [switch]$HybridRenderer,
+    [ValidateSet('Native','Aot')][string]$VuExecution='Native',
+    [switch]$FullOutputResolution,
     [switch]$NonInteractive,
     [ValidateSet('all','unit','acceptance')][string]$TestSuite='all'
 )
@@ -90,7 +100,17 @@ try {
         if ($PSBoundParameters.ContainsKey('Iso') -or $PSBoundParameters.ContainsKey('Toolchain')) {
             throw 'Play uses the paths saved by Build. Run Build with the new paths first.'
         }
-        Invoke-Builder @('run','--disc-cache',$DiscCache)
+        $runArgs=@('run','--disc-cache',$DiscCache,'--mesh-bridge',$MeshBridge)
+        if ($ModelAudit) { $runArgs+='--model-audit' }
+        if ($ModelMesh) { $runArgs+='--model-mesh' }
+        if ($NativeUnlit) { $runArgs+='--native-unlit' }
+        if ($NativeLit) { $runArgs+='--native-lit' }
+        if ($HybridRenderer) { $runArgs+='--hybrid-renderer' }
+        if ($PSBoundParameters.ContainsKey('VuExecution')) { $runArgs+=@('--vu-execution',$VuExecution.ToLowerInvariant()) }
+        if ($FullOutputResolution) { $runArgs+='--full-output-resolution' }
+        if ($ModelTextures) { $runArgs+='--model-textures' }
+        if ($ModelMaterials) { $runArgs+='--model-materials' }
+        Invoke-Builder $runArgs
     } else {
         if (-not $Iso -and $config) { $Iso=$config.iso }
         if (-not $Iso -or -not (Test-Path -LiteralPath $Iso)) {

@@ -5,6 +5,7 @@ extern int ps2_gif_path;
 #include "ps2_hle.h"
 #include "ps2_statecap.h"
 #include "ps2_capture.h"
+#include "ps2_gs_tile_copy.h"
 #include "rn.h"
 #include "rn/rn_int.h"
 #include <stdio.h>
@@ -440,6 +441,7 @@ static const u8 blk_z16s[8][4] = {
 static u16 gs_swz[4][512];
 static int gs_swz_ready;
 static u8 gs_swz4_bytes[512], gs_swz4_shift[16];
+static u8 gs_swz8_bytes[256];
 static int gs_swz4_uniform;
 
 static u32 gs_swz_bit(u32 cls, u32 x, u32 y) {
@@ -482,6 +484,7 @@ static void gs_swz_init(void) {
             if((bit&4u)!=gs_swz4_shift[y])gs_swz4_uniform=0;
         }
     }
+    for(u32 i=0;i<256u;i++)gs_swz8_bytes[i]=(u8)(gs_swz[GS_SW8][i]>>3);
     gs_swz_ready = 1;
 }
 
@@ -2209,6 +2212,24 @@ static int texture_peek(float *out_w, float *out_h, u32 *idx, u32 *dw, u32 *dh) 
     *dh = th;
     return 0;
 }
+/* Byte offsets preserve both GS swizzling and the diagnostic linear layout.
+ * Keep the original four-index hash and scalar tail; no content is retained. */
+static inline u32 decode_t8_bytes(const u8 *block,const u8 *offsets,
+    const u32 *palette,u32 *dst,u32 run,u32 hash) {
+    u32 k=0;
+    for(;k+4u<=run;k+=4u) {
+        u32 r0=block[offsets[k]],r1=block[offsets[k+1u]];
+        u32 r2=block[offsets[k+2u]],r3=block[offsets[k+3u]];
+        dst[k]=palette[r0];dst[k+1u]=palette[r1];
+        dst[k+2u]=palette[r2];dst[k+3u]=palette[r3];
+        hash=(((hash<<13)|(hash>>19))^(r0|(r1<<8)|(r2<<16)|(r3<<24)))*0x9E3779B1u;
+    }
+    for(;k<run;k++) {
+        u32 raw=block[offsets[k]];dst[k]=palette[raw];hash=(hash^raw)*16777619u;
+    }
+    return hash;
+}
+
 /* PSMT4 has one nibble selection for a whole swizzled block row. The
  * byte palette removes per-pixel shifts; packed extraction preserves the
  * existing four-index hash exactly. Linear diagnostic layouts use scalar. */
@@ -2457,24 +2478,8 @@ static u32 current_texture_inner(float *out_w, float *out_h, u32 lod) {
                     if (base <= GS_VRAM_SIZE - 256u) {
                         const u8 *block = src + base;
                         if (psm == PSM_T8) {
-                            for (k = 0; k + 4u <= run; k += 4u) {
-                                const u32 r0 = block[offsets[k] >> 3];
-                                const u32 r1 = block[offsets[k + 1u] >> 3];
-                                const u32 r2 = block[offsets[k + 2u] >> 3];
-                                const u32 r3 = block[offsets[k + 3u] >> 3];
-                                dst[k] = pal[r0];
-                                dst[k + 1u] = pal[r1];
-                                dst[k + 2u] = pal[r2];
-                                dst[k + 3u] = pal[r3];
-                                hash = (((hash << 13) | (hash >> 19))
-                                        ^ (r0 | (r1 << 8) | (r2 << 16) | (r3 << 24)))
-                                     * 0x9E3779B1u;
-                            }
-                            for (; k < run; k++) {
-                                const u32 raw = block[offsets[k] >> 3];
-                                dst[k] = pal[raw];
-                                hash = (hash ^ raw) * 16777619u;
-                            }
+                            hash=decode_t8_bytes(block,gs_swz8_bytes+((y&g.bhmask)<<g.bwsh)+xb,
+                                pal,dst,run,hash);
                         } else if(same_pages && ((same_pages >>
                             (page_row+(x>>g.pwsh))) & 1u)) {
                             u32 sy=y&g.bhmask;
@@ -2810,6 +2815,14 @@ static u32 current_mip_texture(float *out_w, float *out_h, u32 mxl) {
         && ps2_vk_texture_is(atlas_cache[bucket].index, key, hash))
         return atlas_cache[bucket].index;
     u32 aw = bw * 2u, ah = bh + 8u, yoff = 0;
+    /* A direct-cache collision need not rebuild an atlas still in the store. */
+    u32 resident = ps2_vk_texture_find(key, hash, aw, ah);
+    if (resident != 0xFFFFFFFFu) {
+        atlas_cache[bucket].key = key;
+        atlas_cache[bucket].hash = hash;
+        atlas_cache[bucket].index = resident;
+        return resident;
+    }
     u8 *atlas = calloc((size_t)aw * ah, 4);
     if (!atlas) return 0xFFFFFFFFu;
     for (u32 i = 0; i <= mxl; ++i) {
@@ -2817,10 +2830,8 @@ static u32 current_mip_texture(float *out_w, float *out_h, u32 mxl) {
         const u8 *src = ps2_vk_texture_pixels(ids[i]);
         if (!mw) mw = 1;
         if (!mh) mh = 1;
-        for (u32 y = 0; y < mh; ++y)
-            for (u32 x = 0; x < mw; ++x)
-                memcpy(atlas + ((size_t)(yoff+y)*aw+xoff+x)*4,
-                       src + ((size_t)(y%dh[i])*dw[i]+x%dw[i])*4, 4);
+        ps2_copy_tiled_rgba(atlas + ((size_t)yoff * aw + xoff) * 4u,
+                            (size_t)aw * 4u, src, dw[i], dh[i], mw, mh);
         if (i) yoff += mh;
     }
     u32 index = ps2_vk_texture(key, hash, atlas, aw, ah);
@@ -4662,6 +4673,30 @@ void ps2_gs_hwreg_pair(u64 lo, u64 hi) {
 /* IMAGE runs have no register changes between their qwords. Walk a complete
  * block/row span once instead of redoing geometry and upload bookkeeping for
  * each two CT32 pixels. Preserve the scalar path for packed formats/tracing. */
+/* CT32 block offsets stay within 256 bytes. For an entirely resident
+ * block and non-overlapping input, check bounds once and copy CT32's adjacent
+ * even/odd pixels together. Keep per-pixel clipping and ordering otherwise. */
+static void trx_copy_row(u8 *dst,const u8 *src,u64 blockbit,const u16 *offsets,
+                         u32 xb,u32 run,u32 bpp,int disjoint) {
+    if(bpp==4u && disjoint && blockbit<=((u64)GS_VRAM_SIZE-256u)*8u) {
+        u32 base=(u32)(blockbit>>3);
+        u32 k=0;
+        if(run && (xb&1u)) {
+            memcpy(dst+base+(offsets[0]>>3),src,4);k=1;
+        }
+        for(;k+1u<run;k+=2u)
+            memcpy(dst+base+(offsets[k]>>3),src+(size_t)k*4u,8);
+        if(k<run)memcpy(dst+base+(offsets[k]>>3),src+(size_t)k*4u,4);
+        return;
+    }
+    for(u32 k=0;k<run;k++) {
+        u32 off=(u32)((blockbit+offsets[k])>>3);
+        if(bpp==4u) {
+            if(off<=GS_VRAM_SIZE-4u)memcpy(dst+off,src+(size_t)k*4u,4);
+        } else if(off<GS_VRAM_SIZE)dst[off]=src[k];
+    }
+}
+
 static int trx_stream_fast(const u8 *src, u32 qwc) {
     if(PS2_ENV("PS2_TRX_STREAM_SCALAR") || !qwc || !gs_vram || !trx_left
        || (trx_dpsm!=PSM_CT32 && trx_dpsm!=PSM_T8) || !trx_rrw
@@ -4680,6 +4715,9 @@ static int trx_stream_fast(const u8 *src, u32 qwc) {
         if(supplied<n)n=(u32)supplied;
         memcpy(r->bytes+r->pos,src,n);r->pos+=n;
     }
+    uintptr_t source=(uintptr_t)src,dest=(uintptr_t)gs_vram;
+    int disjoint=!PS2_ENV("PS2_TRX_ROW_SCALAR") && (source>=dest+GS_VRAM_SIZE
+        || (source<dest && (u64)count*bpp<=dest-source));
     u32 consumed=0,xend=trx_sax+trx_rrw;
     while(consumed<count) {
         u32 xb=trx_x&trx_g.bwmask;
@@ -4688,11 +4726,10 @@ static int trx_stream_fast(const u8 *src, u32 qwc) {
         u32 run=trx_g.bw-xb;
         if(trx_x<xend && run>xend-trx_x)run=xend-trx_x;
         if(run>count-consumed)run=count-consumed;
-        for(u32 k=0;k<run;k++) {
+        if(bpp==4u)trx_copy_row(gs_vram,src+(size_t)consumed*4u,blockbit,offsets,xb,run,4u,disjoint);
+        else for(u32 k=0;k<run;k++) {
             u32 off=(u32)((blockbit+offsets[k])>>3);
-            if(bpp==4) {
-                if(off<=GS_VRAM_SIZE-4u)memcpy(gs_vram+off,src+(size_t)(consumed+k)*4u,4);
-            } else if(off<GS_VRAM_SIZE)gs_vram[off]=src[consumed+k];
+            if(off<GS_VRAM_SIZE)gs_vram[off]=src[consumed+k];
         }
         consumed+=run;trx_x+=run;trx_left-=run;
         if(trx_x>=xend){trx_x=trx_sax;trx_y++;}

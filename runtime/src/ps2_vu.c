@@ -2,6 +2,8 @@
 #include "ps2_hle.h"
 #include "ps2_capture.h"
 #include "rn.h"
+#include "rn_ac4_model.h"
+#include "rn_ac4_mesh.h"
 #include <stdlib.h>
 
 void ps2_gif_transfer(const ps2_reg128 *data, u32 qwc);
@@ -698,6 +700,7 @@ PS2_INLINE void vu_do_xgkick(ps2_vu *vu, u32 vi) {
         }
     }
     if (vu1_shadow) return;
+    if (PS2_GAME_AC4 && rn_ac4_model_capture_on) rn_ac4_model_audit_kick(vu, vi);
     if (PS2_UNLIKELY(rn_dump_on)) rn_dump_xgkick(vi, vu->mem, vu->mem_size);
     if (PS2_UNLIKELY(rn_vp_mode == 2)) rn_vp_kick(vu, vi);
     if (PS2_UNLIKELY(vu1_test_kicks)) return;
@@ -705,6 +708,7 @@ PS2_INLINE void vu_do_xgkick(ps2_vu *vu, u32 vi) {
     if (PS2_UNLIKELY(rn_census_on)) rn_census_vu_prog = rn_vp_resident_slot() + 1;
     rn_vu_kicking = 1;
     vu_stat_xgkick_qw += ps2_gif_kick(vu->mem, vu->mem_size, vi);
+    if (PS2_GAME_AC4 && rn_ac4_model_mesh_on) rn_ac4_mesh_end();
     rn_vu_kicking = 0;
     rn_census_vu_prog = 0;
 }
@@ -1182,6 +1186,30 @@ static int vu1_recomp_off = -1;
 static int (*vu1_resident_fn)(ps2_vu *, u32, u32, u32 *, u32 *, u32 *);
 static u64 vu1_recomp_runs, vu1_recomp_bails, vu1_interp_runs;
 
+/* Deferred, bounded fallback census; no file I/O or clocks on activation. */
+#define VU1_FALLBACK_N 64
+static struct { u64 image, count; u32 pc; int missing_image; }
+    vu1_fallback[VU1_FALLBACK_N];
+static unsigned vu1_fallback_n;
+static u64 vu1_fallback_overflow;
+static void vu1_note_fallback(u32 pc, int missing_image) {
+    unsigned i;
+    for (i = 0; i < vu1_fallback_n; i++)
+        if (vu1_fallback[i].image == vu_prog_crc &&
+            vu1_fallback[i].pc == pc &&
+            vu1_fallback[i].missing_image == missing_image) {
+            vu1_fallback[i].count++;
+            return;
+        }
+    if (i == VU1_FALLBACK_N) { vu1_fallback_overflow++; return; }
+    vu1_fallback[i].image = vu_prog_crc;
+    vu1_fallback[i].pc = pc;
+    vu1_fallback[i].missing_image = missing_image;
+    vu1_fallback[i].count = 1;
+    vu1_fallback_n++;
+}
+
+
 static int vu1_recomp_enabled(void) {
 #ifndef VU1_HAVE_RECOMP
     return 0;
@@ -1419,9 +1447,9 @@ static int vu1_try_recomp(ps2_vu *vu, u32 *pc, u32 *guard, u32 *fslot,
     if (vu != &vu1 || !vu->micro || !vu1_recomp_enabled()) return 0;
     if (vu1_diag_wants_interp()) return 0;
     if (vu_prog_dirty) vu1_resident_update(vu);
-    if (!vu1_resident_fn) { vu1_interp_runs++; return 0; }
+    if (!vu1_resident_fn) { vu1_note_fallback(*pc, 1); vu1_interp_runs++; return 0; }
     r = vu1_resident_fn(vu, *pc, limit, pc, guard, fslot);
-    if (r == 0) { vu1_interp_runs++; return 0; }
+    if (r == 0) { vu1_note_fallback(*pc, 0); vu1_interp_runs++; return 0; }
     if (r == 2) { vu1_recomp_bails++; return 0; }
     *stopped = r == 1;
     if (*stopped) vu1_recomp_runs++;
@@ -1429,6 +1457,7 @@ static int vu1_try_recomp(ps2_vu *vu, u32 *pc, u32 *guard, u32 *fslot,
 }
 
 void ps2_vu_recomp_report(void) {
+    rn_ac4_model_audit_report();
     u64 tot = vu1_recomp_runs + vu1_interp_runs + vu1_recomp_bails;
     if (vu1_verify_runs)
         ps2_log("vu1 verify: %llu activations run BOTH ways and compared, "
@@ -1440,6 +1469,14 @@ void ps2_vu_recomp_report(void) {
                 "NOT compared (interpreter result retained)",
                 (unsigned long long)vu1_verify_unsupported,
                 (unsigned long long)vu1_verify_partial);
+    for (unsigned i = 0; i < vu1_fallback_n; i++)
+        ps2_log("vu1 fallback: image %016llx entry %04X %s, %llu activations",
+                (unsigned long long)vu1_fallback[i].image, vu1_fallback[i].pc,
+                vu1_fallback[i].missing_image ? "unmatched image" : "uncompiled entry",
+                (unsigned long long)vu1_fallback[i].count);
+    if (vu1_fallback_overflow)
+        ps2_log("vu1 fallback: %llu activations beyond bounded census capacity",
+                (unsigned long long)vu1_fallback_overflow);
     if (!tot) return;
     ps2_log("vu1 recompiled: %llu runs completed, %llu handed back at an "
             "unknown JR, %llu interpreted (%.1f%% recompiled)",
@@ -1454,6 +1491,11 @@ void ps2_vu_recomp_report(void) {
 }
 
 static void vu_run(ps2_vu *vu, u32 start) {
+    if (PS2_GAME_AC4 && vu == &vu1 && rn_ac4_model_capture_on) {
+        if (vu_prog_dirty) vu1_resident_update(vu);
+        rn_ac4_model_audit_begin(vu, start, vu_prog_crc);
+        if(rn_ac4_model_native_on && !vu1_verify_enabled() && rn_ac4_model_try_native(vu,vu_run_limit,vu_do_xgkick))return;
+    }
     if (PS2_UNLIKELY(rn_vp_mode) && vu == &vu1 && rn_vp_run(vu, start)) return;
     u32 pc = start & (vu->micro_size - 8u);
     vu_prog *census = vu_census_enter(vu, pc);
@@ -1661,6 +1703,7 @@ static void vu_run(ps2_vu *vu, u32 start) {
                 stop ? "stopped" : "hit the instruction guard", pc);
     PS2_PHASE_END(PS2_PH_VU); }
     vu->running = 0;
+    if(PS2_GAME_AC4 && vu==&vu1 && rn_ac4_model_plan_on)rn_ac4_model_audit_end(vu,guard);
 }
 
 void ps2_vu0_callms(ps2_ctx *ctx, u32 addr) {

@@ -107,4 +107,53 @@ class WindowsLauncherAcceptance(unittest.TestCase):
 
     def test_play_forwards_ram_cache_option(self):
         calls = self.check(['run'], '-DiscCache', 'memory', launcher='play.cmd')
-        self.assertEqual(calls[0], ['run', '--disc-cache', 'memory'])
+        self.assertEqual(calls[0], ['run', '--disc-cache', 'memory', '--mesh-bridge', 'off'])
+
+    def test_play_opts_into_mesh_bridge(self):
+        calls = self.check(['run'], '-MeshBridge', 'triangles', launcher='play.cmd')
+        self.assertEqual(calls[0][-2:], ['--mesh-bridge', 'triangles'])
+
+    def test_invalid_mesh_mode_does_not_launch(self):
+        self.check([], '-MeshBridge', 'all', launcher='play.cmd', code=1)
+
+    def test_play_forwards_model_audit_without_enabling_meshes(self):
+        calls = self.check(['run'], '-ModelAudit', launcher='play.cmd')
+        self.assertEqual(calls[0], ['run', '--disc-cache', 'stream', '--mesh-bridge', 'off', '--model-audit'])
+
+    def test_play_forwards_native_model_mesh(self):
+        calls = self.check(['run'], '-ModelMesh', launcher='play.cmd')
+        self.assertEqual(calls[0], ['run', '--disc-cache', 'stream', '--mesh-bridge', 'off', '--model-mesh'])
+
+    def test_play_forwards_native_model_materials(self):
+        calls = self.check(['run'], '-ModelMaterials', launcher='play.cmd')
+        self.assertEqual(calls[0], ['run', '--disc-cache', 'stream', '--mesh-bridge', 'off', '--model-materials'])
+
+    def test_play_forwards_native_model_textures(self):
+        calls = self.check(['run'], '-ModelTextures', launcher='play.cmd')
+        self.assertEqual(calls[0], ['run', '--disc-cache', 'stream', '--mesh-bridge', 'off', '--model-textures'])
+
+    def test_play_forwards_native_unlit(self):
+        calls = self.check(['run'], '-NativeUnlit', launcher='play.cmd')
+        self.assertEqual(calls[0], ['run', '--disc-cache', 'stream', '--mesh-bridge', 'off', '--native-unlit'])
+
+    def test_play_forwards_hybrid_renderer(self):
+        calls = self.check(['run'], '-HybridRenderer', launcher='play.cmd')
+        self.assertIn('--hybrid-renderer', calls[0])
+
+    def test_play_forwards_aot_vu_policy(self):
+        calls=self.check(['run'],'-HybridRenderer','-VuExecution','Aot',launcher='play.cmd')
+        self.assertIn('--hybrid-renderer',calls[0])
+        i=calls[0].index('--vu-execution')
+        self.assertEqual(calls[0][i+1],'aot')
+
+    def test_invalid_vu_policy_does_not_launch(self):
+        self.check([], '-VuExecution', 'interpolated', launcher='play.cmd', code=1)
+
+    def test_play_forwards_full_output_resolution(self):
+        calls = self.check(['run'], '-HybridRenderer', '-FullOutputResolution', launcher='play.cmd')
+        self.assertIn('--hybrid-renderer',calls[0])
+        self.assertIn('--full-output-resolution',calls[0])
+
+    def test_play_forwards_native_lit(self):
+        calls = self.check(['run'], '-NativeLit', launcher='play.cmd')
+        self.assertEqual(calls[0], ['run', '--disc-cache', 'stream', '--mesh-bridge', 'off', '--native-lit'])

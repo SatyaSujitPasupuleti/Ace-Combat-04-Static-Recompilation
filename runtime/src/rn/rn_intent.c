@@ -3,6 +3,7 @@
 #include "ps2_gfxq.h"
 #include "ps2_capture.h"
 #include "rn_int.h"
+#include "rn_ac4_hud_group.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,12 +28,22 @@ typedef struct {
     u32 start, end;
     u32 off, len;
     u32 emitted;
+    u64 ac4_packet_hash;
+    u32 dependency_count;
+    ac4_hud_external dependency[8];
+    u64 dependency_hash[8];
 } pend;
 static pend pends[PEND_MAX];
 static u32 n_pend;
 static int pends_sorted = 1;
 static u8 *arena;
 static u32 arena_n;
+static u64 ac4_stale_packets,ac4_partial_packets;
+static u64 ac4_hash_packet(u32 start,u32 end) {
+    u64 hash=1469598103934665603ull;
+    for(u32 p=start;p<end;p+=4){hash^=ps2_r32(p);hash*=1099511628211ull;}
+    return hash;
+}
 
 static u32 n_clouds;
 static int claim_open;
@@ -84,6 +95,7 @@ static u8 *pend_add(u32 start, u32 end, u32 len) {
     p->off = arena_n;
     p->len = len;
     p->emitted = 0;
+    p->ac4_packet_hash=0;p->dependency_count=0;
     if (n_pend && start < pends[n_pend - 1].start) pends_sorted = 0;
     rec = arena + arena_n;
     arena_n += len;
@@ -120,6 +132,25 @@ void rn_intent_frame_end(void) {
     update_pending();
 }
 
+u32 rn_dma_chunk_limit(u32 madr,u32 qwc) {
+    if(!PS2_GAME_AC4 || !qwc || !arena)return qwc;
+    u32 limit=qwc;
+    for(u32 i=0;i<n_pend;++i){
+        const pend *p=pends+i;rn_intent_hdr h;
+        if(p->len<sizeof h)continue;
+        memcpy(&h,arena+p->off,sizeof h);
+        if(h.kind!=RN_INT_AC4_SPRITE && !(h.kind==RN_INT_GROUP2D && p->ac4_packet_hash))continue;
+        /* Split only at complete qword boundaries; zero is never returned.
+         * Emitted records still supply the closing boundary of an open claim. */
+        u32 boundaries[2]={p->start,p->end};
+        for(unsigned j=0;j<2;++j){
+            u32 b=boundaries[j];
+            if(b>madr && !((b-madr)&15u) && (b-madr)/16u<limit)limit=(b-madr)/16u;
+        }
+    }
+    return limit;
+}
+
 void rn_dma_transfer_slow(int ch, u32 madr, u32 qwc, int after) {
     (void)ch;
     if (after) {
@@ -142,6 +173,26 @@ void rn_dma_transfer_slow(int ch, u32 madr, u32 qwc, int after) {
         }
         if (pends[lo].start <= madr && madr < pends[lo].end && !pends[lo].emitted) {
             pend *p = &pends[lo];
+            if(PS2_GAME_AC4 && p->ac4_packet_hash) {
+                u64 actual=ac4_hash_packet(p->start,p->end);
+                int dependency_stale=0;
+                for(u32 d=0;d<p->dependency_count;d++)
+                    if(ac4_hash_packet(p->dependency[d].address,p->dependency[d].address+p->dependency[d].bytes)!=p->dependency_hash[d])dependency_stale=1;
+                if(actual!=p->ac4_packet_hash || dependency_stale || madr!=p->start)
+                {
+                    ps2_log("ac4 sky ownership: record=%llu range=%08x..%08x dma=%08x qwc=%u hash=%016llx actual=%016llx",
+                        (unsigned long long)(st_int.emitted+1),p->start,p->end,madr,qwc,
+                        (unsigned long long)p->ac4_packet_hash,(unsigned long long)actual);
+                    /* Guest packet memory was reused, or this transfer cannot
+                     * establish the start of the planned primitive stream.
+                     * Do not attach an obsolete description to unrelated GS data. */
+                    if(actual!=p->ac4_packet_hash || dependency_stale)ac4_stale_packets++;
+                    else ac4_partial_packets++;
+                    p->emitted=1;st_int.dropped++;
+                    if(claim_open)send_claim_end();
+                    update_pending();return;
+                }
+            }
             if (claim_open) send_claim_end();
             send(arena + p->off, p->len);
             p->emitted = 1;
@@ -598,9 +649,168 @@ static int code_matches(u32 addr, const u32 *w) {
     return 1;
 }
 
+static void ac4_sky_queue(u32 start,u32 end,const void *input,u32 bytes);
+static void ac4_cloud_queue(u32 start,u32 end,const void *vertices,u32 count);
+static void ac4_sprite_queue(u32 start,u32 end,const void *record,u32 bytes);
+#include "rn_ac4_sky_audit.h"
+#include "rn_ac4_cloud_audit.h"
+#include "rn_ac4_2d_audit.h"
+static void ac4_screen_queue(u32 packet,u32 caller);
+#include "rn_ac4_screen_sprite_audit.h"
+#include "rn_ac4_hud_group.h"
+static int ac4_hud_queue(u32 start,u32 end,u32 site,const ac4_hud_group *plan);
+#include "rn_ac4_hud_group_audit.h"
+
+static int by_offset(const void *a,const void *b) {
+    u32 x=((const pend *)a)->off,y=((const pend *)b)->off;
+    return x<y?-1:x>y;
+}
+/* AC4 has no AC5 flush hook. Reclaim delivered records and descriptions of
+ * overwritten packets without discarding still-live transfers or closing an
+ * active claim. Sort by arena offset before overlapping in-place compaction. */
+static void ac4_reclaim_pending(void) {
+    if(!n_pend)return;
+    qsort(pends,n_pend,sizeof pends[0],by_offset);
+    u32 keep=0,bytes=0;
+    for(u32 i=0;i<n_pend;++i) {
+        pend p=pends[i];
+        if(p.emitted)continue;
+        if(p.ac4_packet_hash && p.ac4_packet_hash!=ac4_hash_packet(p.start,p.end)) {
+            st_int.dropped++;ac4_stale_packets++;continue;
+        }
+        memmove(arena+bytes,arena+p.off,p.len);
+        p.off=bytes;bytes+=p.len;pends[keep++]=p;
+    }
+    n_pend=keep;arena_n=bytes;pends_sorted=keep<2;
+    update_pending();
+}
+
+/* Only called after the original screen helper's complete packet/allocation
+ * shadow succeeds. Keep guest positions until AC4 layout semantics are known. */
+static void ac4_screen_queue(u32 packet,u32 caller) {
+    if(!arena)return;
+    ac4_reclaim_pending();
+    rn_intent_hdr h;u8 *dst=pend_add(packet,packet+64,sizeof h);
+    if(!dst)return;
+    pends[n_pend-1].ac4_packet_hash=ac4_hash_packet(packet,packet+64);
+    hdr_init(&h,RN_INT_GROUP2D,sizeof h,caller,packet);h.flags=RN_G_WORLD;
+    memcpy(dst,&h,sizeof h);
+}
+
+/* Replace child sprite claims only when every group payload can be registered.
+ * Payloads retain their DMA address: allocation order never becomes draw order. */
+static int ac4_hud_queue(u32 start,u32 end,u32 site,const ac4_hud_group *plan) {
+    if(!arena || !plan || !plan->count || plan->count>AC4_HUD_GROUP_PACKETS
+       || plan->external_count>8 || end<=start || !ac4_screen_range(start,end-start))return 0;
+    if(claim_open && start<claim_end && end>claim_start)return 0;
+    for(u32 i=0;i<plan->external_count;i++) {
+        ac4_hud_external d=plan->external[i];
+        if(!d.bytes || d.bytes>16416 || (d.bytes&15) || (d.address&15) || !ac4_screen_range(d.address,d.bytes)
+           || (d.address<end && d.address+d.bytes>start))return 0;
+    }
+    u32 previous=0,replace=0;
+    for(u32 i=0;i<plan->count;i++) {
+        ac4_hud_payload p=plan->payload[i];
+        if(!p.bytes || (p.offset&15) || (p.bytes&15) || p.offset<16 || p.offset<previous
+           || p.offset>end-start || p.bytes>end-start-p.offset)return 0;
+        previous=p.offset+p.bytes;
+    }
+    for(u32 i=0;i<n_pend;i++) {
+        pend *p=pends+i;if(p->start>=end || p->end<=start)continue;
+        rn_intent_hdr h;
+        if(p->emitted || p->start<start || p->end>end || p->len!=sizeof h)return 0;
+        memcpy(&h,arena+p->off,sizeof h);
+        if(h.kind!=RN_INT_GROUP2D || h.flags!=RN_G_WORLD || !p->ac4_packet_hash)return 0;
+        /* A child must lie completely in a proposed payload, never a DMA tag. */
+        int covered=0;for(u32 j=0;j<plan->count;j++)
+            if(p->start>=start+plan->payload[j].offset && p->end<=start+plan->payload[j].offset+plan->payload[j].bytes)covered=1;
+        if(!covered)return 0;
+        replace++;
+    }
+    if(n_pend-replace+plan->count>PEND_MAX || arena_n>ARENA_BYTES-plan->count*sizeof(rn_intent_hdr))return 0;
+    /* No allocation or validation can fail after this point. */
+    for(u32 i=0;i<n_pend;i++)if(pends[i].start<end && pends[i].end>start)pends[i].emitted=1;
+    ac4_reclaim_pending();
+    for(u32 i=0;i<plan->count;i++) {
+        u32 a=start+plan->payload[i].offset,b=a+plan->payload[i].bytes;
+        rn_intent_hdr h;u8 *dst=pend_add(a,b,sizeof h);
+        hdr_init(&h,RN_INT_GROUP2D,sizeof h,site,a);
+        pends[n_pend-1].ac4_packet_hash=ac4_hash_packet(a,b);
+        pends[n_pend-1].dependency_count=plan->external_count;
+        for(u32 d=0;d<plan->external_count;d++) {
+            pends[n_pend-1].dependency[d]=plan->external[d];
+            pends[n_pend-1].dependency_hash[d]=ac4_hash_packet(plan->external[d].address,plan->external[d].address+plan->external[d].bytes);
+        }
+        memcpy(dst,&h,sizeof h);
+    }
+    return 1;
+}
+
+static void ac4_sky_queue(u32 start,u32 end,const void *input,u32 bytes) {
+    const char *e=getenv("PS2_AC4_SKY_MESH");
+    if(!e || strcmp(e,"1") || !arena)return;
+    ac4_reclaim_pending();
+    if(!claim_open) {
+        int all=1;for(u32 i=0;i<n_pend;++i)if(!pends[i].emitted){all=0;break;}
+        if(all)rn_intent_frame_end();
+    }
+    rn_intent_hdr h;u32 len=sizeof h+bytes;u8 *dst=pend_add(start,end,len);
+    if(!dst)return;
+    pends[n_pend-1].ac4_packet_hash=ac4_hash_packet(start,end);
+    int haze=bytes==sizeof(ac4_sky_haze_input);
+    hdr_init(&h,haze?RN_INT_AC4_HAZE:RN_INT_AC4_SKY,len,haze?0x00111310u:0x00111138u,start);
+    memcpy(dst,&h,sizeof h);memcpy(dst+sizeof h,input,bytes);
+}
+
+static int ac4_cloud_prefix(u32 start) {
+    /* 00116918 prepends a three-qword AD state packet before calling the
+     * plane producer. DMA starts there, not at the producer's first tag.
+     * Validate the state-only prefix before widening ownership to include it. */
+    if(start<48 || !ac4_sky_range(start-48,48)
+       || ps2_r64(start-48)!=UINT64_C(0x1000000000008002)
+       || ps2_r64(start-40)!=14 || ps2_r64(start-24)!=8
+       || ps2_r64(start-8)!=0x40)return 0;
+    return 1;
+}
+static void ac4_cloud_queue(u32 start,u32 end,const void *vertices,u32 count) {
+    const char *e=getenv("PS2_AC4_CLOUD_MESH");
+    if(!e || strcmp(e,"1") || !arena || !count || count>1600)return;
+    if(!ac4_cloud_prefix(start))return;
+    start-=48;
+    ac4_reclaim_pending();
+    if(!claim_open){int all=1;for(u32 i=0;i<n_pend;++i)if(!pends[i].emitted){all=0;break;}
+        if(all)rn_intent_frame_end();}
+    rn_intent_hdr h;u32 bytes=count*sizeof(ac4_cloud_mesh_vertex),len=sizeof h+4+bytes;
+    u8 *dst=pend_add(start,end,len);if(!dst)return;
+    pends[n_pend-1].ac4_packet_hash=ac4_hash_packet(start,end);
+    hdr_init(&h,RN_INT_AC4_CLOUD,len,0x00116320u,start);
+    memcpy(dst,&h,sizeof h);memcpy(dst+sizeof h,&count,4);memcpy(dst+sizeof h+4,vertices,bytes);
+}
+
+static void ac4_sprite_queue(u32 start,u32 end,const void *record,u32 bytes) {
+    const char *e=getenv("PS2_AC4_SPRITE_MESH");
+    if(!e || strcmp(e,"1") || !arena || start<32 || bytes!=sizeof(ac4_cloud_sprite_record))return;
+    if(!ac4_sky_range(start-32,32) || ps2_r64(start-32)!=UINT64_C(0x2400000000008001)
+       || ps2_r64(start-24)!=0x16)return;
+    start-=32;ac4_reclaim_pending();
+    rn_intent_hdr h;u32 len=sizeof h+sizeof(ac4_cloud_sprite_mesh);u8 *dst=pend_add(start,end,len);
+    if(!dst)return;
+    ac4_cloud_sprite_mesh m;memset(&m,0,sizeof m);memcpy(&m.sprite,record,bytes);m.rgba=ps2_r32(start+24);
+    pends[n_pend-1].ac4_packet_hash=ac4_hash_packet(start,end);
+    hdr_init(&h,RN_INT_AC4_SPRITE,len,0x001152d8,start);
+    memcpy(dst,&h,sizeof h);memcpy(dst+sizeof h,&m,sizeof m);
+}
+
 void rn_intent_init(void) {
     /* AC5 guest layouts and vector-program replacements are unverified for AC4. */
-    if (PS2_GAME_AC4) return;
+    if (PS2_GAME_AC4) {
+        const char *mesh=getenv("PS2_AC4_SKY_MESH");
+        const char *cloud=getenv("PS2_AC4_CLOUD_MESH");
+        const char *sprite=getenv("PS2_AC4_SPRITE_MESH");
+        const char *screen=getenv("PS2_AC4_SCREEN_2D");
+        if((mesh && !strcmp(mesh,"1")) || (cloud && !strcmp(cloud,"1")) || (sprite && !strcmp(sprite,"1")) || (screen && !strcmp(screen,"1")))arena=(u8 *)malloc(ARENA_BYTES);
+        ac4_sky_audit_init();ac4_cloud_audit_init();ac4_2d_audit_init();ac4_screen_shadow_init();ac4_hud_init(); return;
+    }
     const char *e = getenv("PS2_RN_INTENTS");
     if (e && *e == '0') {
         ps2_log("rn: render intents off (PS2_RN_INTENTS=0)");
@@ -691,6 +901,13 @@ void rn_intent_init(void) {
 }
 
 void rn_intent_report(void) {
+    if(PS2_GAME_AC4){ac4_screen_shadow_report();ac4_hud_report();}
+    if(PS2_GAME_AC4)ac4_2d_audit_report();
+    if(PS2_GAME_AC4)ac4_cloud_audit_report();
+    if(PS2_GAME_AC4 && (ac4_stale_packets || ac4_partial_packets))
+        ps2_log("ac4 sky ownership fallback: %llu stale packets, %llu partial packets kept on GS",
+            (unsigned long long)ac4_stale_packets,(unsigned long long)ac4_partial_packets);
+    if (PS2_GAME_AC4) ac4_sky_audit_report();
     if (!st_int.frames) return;
     ps2_log("rn: intents -- %llu recorded (%.1f per frame, %.1f KB per frame), "
             "%llu handed over with their packets, %llu never transferred, "

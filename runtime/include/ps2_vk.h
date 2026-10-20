@@ -17,6 +17,10 @@ typedef struct ps2_vk_vertex {
 
 #define PS2_VK_RUV_SPRITE (1u << 29)
 
+/* Verified AC4 scene framebuffer is slot 1, copied into display slot 0.
+ * AC5 uses scene slot 0. Other targets remain in-place/fallback. */
+#define PS2_VK_2D_SCENE_RT (PS2_GAME_AC4 ? 1u : 0u)
+
 typedef struct ps2_vk_state {
     u32 fb_w, fb_h;
     u32 fb_psm;
@@ -64,7 +68,7 @@ typedef struct ps2_vk_state {
     int zcopy;
     int colclip;
     u32 emitter;
-    int native_region;
+    int native_region; /* bit 0: cropped region; bit 1: supplied levels; bit 2: hardware filter; bit 3: anisotropic gradients */
 } ps2_vk_state;
 
 enum { PS2_VK_POINTS = 0, PS2_VK_LINES = 1, PS2_VK_TRIANGLES = 2 };
@@ -132,10 +136,14 @@ void ps2_vk_draw_mesh_topo(const ps2_vk_state *st, const ps2_vk_mesh_block *b,
 extern void (*ps2_vk_before_record)(void);
 
 u32  ps2_vk_texture(u64 key, u32 hash, const u8 *rgba, u32 w, u32 h);
+u32  ps2_vk_texture_find(u64 key, u32 hash, u32 w, u32 h);
 u32 ps2_vk_texture_exact(u64 key, u32 hash, const u8 *rgba, u32 w, u32 h);
 int  ps2_vk_texture_is(u32 idx, u64 key, u32 hash);
 
 u32  ps2_vk_texture_native(u32 src, u32 x, u32 y, u32 w, u32 h);
+/* Clamp bits: 1=U, 2=V. Native mip footprints must not wrap across cropped edges. */
+u32  ps2_vk_texture_native_wrap(u32 src, u32 x, u32 y, u32 w, u32 h, u32 clamp);
+u32 ps2_vk_texture_native_atlas(u32 src,u32 bw,u32 bh,u32 x,u32 y,u32 w,u32 h,u32 mxl,u32 clamp);
 u32  ps2_vk_texture_native_find(u64 key, u32 hash, u32 w, u32 h);
 u32  ps2_vk_texture_native_rgba(u64 key, u32 hash, const u8 *rgba, u32 w, u32 h);
 const u8 *ps2_vk_texture_pixels(u32 idx);
@@ -149,6 +157,16 @@ int  ps2_vk_present(u32 disp_x, u32 disp_y, u32 disp_w, u32 disp_h, u32 rt);
 
 extern int ps2_vk_lockstep;
 
+/* Wait for published fields to finish on the render thread (producer only). */
+void ps2_vk_drain(void);
+/* Serialized settings transition; does not persist a settings file. */
+int ps2_vk_set_anisotropy(int value);
+/* Hidden replay diagnostic: resize the real SDL/Vulkan window without saving settings. */
+int ps2_vk_test_resize_window(int width, int height);
+/* Hidden replay diagnostic: execute one field without presenting it. */
+int ps2_vk_test_skip_next_present(void);
+/* Snapshot restore discards cross-field overlay history, not GPU allocations. */
+void ps2_vk_replay_overlay_reset(void);
 int  ps2_vk_screenshot(const char *path);
 
 extern float ps2_vk_display_aspect;

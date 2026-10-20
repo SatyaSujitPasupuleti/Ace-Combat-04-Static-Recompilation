@@ -1,5 +1,6 @@
 #include "rn_int.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -137,6 +138,9 @@ int rn_sky_claim_prim(const struct ps2_vk_state *st, int kind,
 }
 
 void rn_sky_report(void) {
+    rn_ac4_sky_native_report();
+    rn_ac4_cloud_native_report();
+    rn_ac4_sprite_native_report();
     if (!st_sky.domes && !st_sky.hazes) return;
     ps2_log("rn: native sky -- %llu domes and %llu haze passes (%llu layers): %llu drawn "
             "by mesh.vert (%llu strip triangles claimed), %llu left emulated",
@@ -144,3 +148,7 @@ void rn_sky_report(void) {
             (unsigned long long)st_sky.layers, (unsigned long long)st_sky.native,
             (unsigned long long)st_sky.claimed, (unsigned long long)st_sky.fallback);
 }
+
+#include "rn_ac4_sky_native.h"
+#include "rn_ac4_cloud_native.h"
+#include "rn_ac4_sprite_native.h"

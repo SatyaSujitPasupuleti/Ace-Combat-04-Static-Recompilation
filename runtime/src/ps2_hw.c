@@ -3,6 +3,7 @@
 #include "ps2_capture.h"
 #include "ps2_gfxq.h"
 #include "rn.h"
+#include "rn_ac4_mesh.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -295,6 +296,7 @@ int ps2_gif_path;
 
 static u64 gif_tag_hist[4];
 static u64 gif_tag_qwc[4];
+static u64 gif_sprite_packets,gif_sprite_packet_qw;
 
 static u64 gif_runaway, gif_abandoned;
 
@@ -422,10 +424,34 @@ static void gif_feed(const ps2_reg128 *q) {
     }
 }
 
+/* AC4's bounded sprite rows are reglist UV/XYZ3/UV/XYZ2. Preflight the
+ * complete row before writes; split or unfamiliar packets use gif_feed.
+ * GS writes (including the two vertex kicks) remain ordered and unchanged. */
+static u32 gif_sprite_packet(const void *data,u32 qwc) {
+    if(!data || !qwc || gif.active)return 0;
+    ps2_reg128 tag;memcpy(&tag,data,sizeof tag);
+    u32 loops=(u32)(tag.ud[0]&32767u);
+    if(!loops || loops>64 || tag.ud[0]!=(UINT64_C(0x4400000000008000)|loops)
+       || tag.ud[1]!=UINT64_C(0x53d3) || qwc<1+2*loops)return 0;
+    gif.eop=1;gif.nloop=loops;gif.flg=1;gif.nreg=4;gif.regs=tag.ud[1];
+    gif.n=gif.r=0;gif.active=1;gif_tag_hist[1]++;gif_tag_qwc[1]+=loops;
+    for(u32 i=0;i<loops;i++) {
+        u64 v[4];memcpy(v,(const u8*)data+16+32*i,sizeof v);
+        ps2_gs_write_reg(3,v[0]);ps2_gs_write_reg(13,v[1]);
+        ps2_gs_write_reg(3,v[2]);ps2_gs_write_reg(5,v[3]);
+        gif.n+=4;
+    }
+    gif.active=0;return 1+2*loops;
+}
+
 void ps2_gif_transfer(const ps2_reg128 *data, u32 qwc) {
     PS2_PHASE_BEGIN(PS2_PH_GIF);
     if (!ps2_gif_path) ps2_gif_path = 3;
     for (u32 i = 0; i < qwc;) {
+        if(PS2_GAME_AC4 && rn_ac4_sprite_mesh_on && !ps2_diag_armed && !g_cap_shallow) {
+            u32 used=gif_sprite_packet((const u8*)data+(size_t)i*16,qwc-i);
+            if(used){gif_sprite_packets++;gif_sprite_packet_qw+=used;i+=used;continue;}
+        }
         if (gif.active && gif.flg == 2u && !ps2_diag_armed && !g_cap_shallow) {
             u32 n = gif.nloop - gif.n;
             if (n > qwc - i) n = qwc - i;
@@ -471,7 +497,13 @@ void ps2_gif_dump_arm(u32 packets) {
     gif_dump_skip = e ? (u32)strtoul(e, NULL, 0) : 0;
 }
 
+static u64 gif_model_fast_qw,gif_mesh_packets,gif_mesh_packet_qw;
+static u64 gif_cockpit_packets,gif_cockpit_qw;
 void ps2_gif_kick_report(void) {
+    if(gif_sprite_packets)ps2_log("ac4 sprite GIF packets: %llu packets, %llu qwords bypassed generic parsing",(unsigned long long)gif_sprite_packets,(unsigned long long)gif_sprite_packet_qw);
+    if(gif_mesh_packets)ps2_log("ac4 mesh GIF packets: %llu packets, %llu qwords bypassed generic parsing",(unsigned long long)gif_mesh_packets,(unsigned long long)gif_mesh_packet_qw);
+    if(gif_cockpit_packets)ps2_log("ac4 cockpit GIF packets: %llu packets, %llu qwords bypassed generic parsing",(unsigned long long)gif_cockpit_packets,(unsigned long long)gif_cockpit_qw);
+    if(gif_model_fast_qw) ps2_log("ac4 model GIF: %llu payload qwords bypassed generic decoding", (unsigned long long)gif_model_fast_qw);
     u64 tot = gif_kick_empty + gif_kick_drawn;
     if (!tot) return;
     ps2_log("PATH1 XGKICK packets: %llu carried geometry, %llu were empty "
@@ -580,6 +612,64 @@ static void gif_dump_packet(const u8 *vumem, u32 qwords, u32 addr_qw) {
     }
 }
 
+/* Known mesh payload: preserve register writes, ADC and GIF continuation state,
+ * while avoiding generic payload format/register decoding. Terrain fans/strips
+ * use up to ten vertices; tags/prefixes still use the ordinary parser. */
+static int gif_model_vertices(const u8 *vumem,u32 qwords,u32 first,u32 remaining) {
+    if(!qwords || !vumem || !gif.active || gif.flg || gif.nreg!=3 || gif.nloop<3 || gif.nloop>10
+       || gif.n || gif.r || gif.regs!=0x412ull || remaining<3*gif.nloop) return 0;
+    u32 vertices=gif.nloop;
+    for(u32 v=0;v<vertices;v++) {
+        static const u32 regs[3]={2,1,4};
+        for(u32 r=0;r<3;r++) {
+            const ps2_reg128 *q=(const ps2_reg128 *)(vumem+((first+v*3+r)%qwords)*16u);
+            gif_packed(regs[r],q);
+            if(++gif.r==3) {gif.r=0;if(++gif.n==vertices)gif.active=0;}
+        }
+    }
+    return (int)(3*vertices);
+}
+
+/* Preflight the complete mesh packet before issuing any GS writes. Only
+ * bounded packed A+D setup and ST/RGBA/XYZF streams are supported here. */
+static u32 gif_mesh_packet(const u8 *memory,u32 qwords,u32 first) {
+    struct {u32 at,loops,nreg;u64 tag,regs;} tags[8];u32 count=0,used=0,geometry=0;
+    if(!memory || !qwords || gif.active)return 0;
+    while(used<qwords && count<8) {
+        const ps2_reg128 *q=(const ps2_reg128*)(memory+((first+used)%qwords)*16);
+        u64 tag=q->ud[0],regs=q->ud[1];u32 loops=(u32)(tag&32767),nreg=(u32)(tag>>60),flg=(u32)((tag>>58)&3);
+        if(flg)return 0;
+        int setup=nreg==1 && (regs&15)==14 && loops<=8;
+        int mesh=nreg==3 && (regs&4095)==0x412 && loops>=3 && loops<=23;
+        if(!setup && !mesh)return 0;
+        u32 payload=nreg*loops;if(payload>qwords-used-1)return 0;
+        tags[count].at=first+used+1;tags[count].loops=loops;tags[count].nreg=nreg;
+        tags[count].tag=tag;tags[count++].regs=regs;geometry+=mesh;
+        used+=1+payload;
+        if(tag&32768)break;
+    }
+    if(!count || !(tags[count-1].tag&32768) || !geometry)return 0;
+    for(u32 t=0;t<count;t++) {
+        gif.eop=(u32)((tags[t].tag>>15)&1);gif.nloop=tags[t].loops;gif.flg=0;
+        gif.nreg=tags[t].nreg;gif.regs=tags[t].regs;gif.n=gif.r=0;gif.active=gif.nloop!=0;
+        if((tags[t].tag>>46)&1)ps2_gs_write_reg(0,(tags[t].tag>>47)&2047);
+        gif_tag_hist[0]++;gif_tag_qwc[0]+=gif.nloop;
+        for(u32 n=0;n<gif.nloop;n++) {
+            u32 at=tags[t].at+n*gif.nreg;
+            if(gif.nreg==1) {
+                const ps2_reg128 *q=(const ps2_reg128*)(memory+(at%qwords)*16);
+                ps2_gs_write_reg((u32)(q->ud[1]&255),q->ud[0]);
+            } else {
+                gif_packed(2,(const ps2_reg128*)(memory+(at%qwords)*16));
+                gif_packed(1,(const ps2_reg128*)(memory+((at+1)%qwords)*16));
+                gif_packed(4,(const ps2_reg128*)(memory+((at+2)%qwords)*16));
+            }
+        }
+        gif.n=gif.nloop;gif.active=0;
+    }
+    return used;
+}
+
 u32 ps2_gif_kick(const u8 *vumem, u32 mem_size, u32 addr_qw) {
     u32 qwords = mem_size / 16u;
     u32 i;
@@ -598,11 +688,25 @@ u32 ps2_gif_kick(const u8 *vumem, u32 mem_size, u32 addr_qw) {
             gif_dump_packet(vumem, qwords, addr_qw);
         }
     }
+    if(PS2_GAME_AC4 && rn_ac4_model_mesh_on && !rn_ac4_model_audit_on && !rn_ac4_model_plan_on && rn_ac4_mesh_pending()) {
+        int cockpit_packet=rn_ac4_mesh_cockpit_pending();
+        u32 used=gif_mesh_packet(vumem,qwords,addr_qw);
+        if(used) {
+            gif_mesh_packets++;gif_mesh_packet_qw+=used;
+            if(cockpit_packet) {gif_cockpit_packets++;gif_cockpit_qw+=used;}
+            ps2_gif_path=0;PS2_PHASE_END(PS2_PH_GIF);return used;
+        }
+    }
     for (i = 0; i < qwords; i++) {
         const ps2_reg128 *q =
             (const ps2_reg128 *)(vumem + (((addr_qw + i) % qwords) * 16u));
         int was_active = gif.active;
         gif_feed(q);
+        if(PS2_GAME_AC4 && rn_ac4_model_mesh_on && !rn_ac4_model_audit_on
+           && rn_ac4_mesh_pending()) {
+            int used=gif_model_vertices(vumem,qwords,addr_qw+i+1,qwords-i-1);
+            if(used) {i+=(u32)used;gif_model_fast_qw+=(u32)used;was_active=1;}
+        }
         if (gif.eop && !gif.active && (was_active || gif.nloop == 0))
             { ps2_gif_path = 0; PS2_PHASE_END(PS2_PH_GIF); return i + 1; }
     }
@@ -667,6 +771,20 @@ static void dma_to_peripheral(int ch, u32 madr, u32 qwc) {
                         ch, madr, qwc, room);
             qwc = room;
         }
+    }
+    if(PS2_GAME_AC4 && qwc && rn_intents_pending && (ch==1 || ch==2)) {
+        /* A transfer may contain several independent sprite rows. Preserve
+         * VIF/GIF parser state and byte order, inserting intent events exactly
+         * at the owned row boundaries, including in deep captures. */
+        u32 done=0;
+        while(done<qwc){
+            u32 address=madr+done*16u,n=rn_dma_chunk_limit(address,qwc-done);
+            rn_dma_transfer(ch,address,n,0);
+            if(g_cap_deep){if(ch==1)ps2_cap_vif_qw(ch,src+done,n);else ps2_cap_gif_qw(src+done,n);}
+            if(ch==1)ps2_gfxq_vif_qw(ch,src+done,n);else ps2_gfxq_gif_qw(src+done,n);
+            rn_dma_transfer(ch,address,n,1);done+=n;
+        }
+        PS2_PHASE_END(PS2_PH_DMA);return;
     }
     if (ch == 1 || ch == 2) rn_dma_transfer(ch, madr, qwc, 0);
     if (g_cap_deep) {

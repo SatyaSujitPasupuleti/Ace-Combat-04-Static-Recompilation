@@ -3,6 +3,8 @@
 #include "ps2_statecap.h"
 #include "ps2_capture.h"
 #include "ps2_vk.h"
+#include "ps2_vk_mesh_blocks.h"
+#include "ps2_vk_mip_chain.h"
 #include "ps2_settings.h"
 #include "ps2_ui.h"
 
@@ -69,6 +71,9 @@ typedef struct {
     int uploaded_gen;
     u32 rec_seq;
     u32 levels;
+    u32 native_clamp;
+    u8 *native_mips;
+    size_t native_mip_bytes;
     VkImage image;
     VkDeviceMemory memory;
     VkDeviceSize memory_offset, memory_size;
@@ -86,6 +91,14 @@ static u32 ntextures;
 
 #define TEX_HASH 4096u
 static s32 tex_head[TEX_HASH], tex_tail[TEX_HASH], tex_next[VK_MAX_TEXTURES];
+/* Snapshot age order once per collection; ties retain the original slot order. */
+typedef struct { u32 slot, age; } tex_retire_candidate;
+static int tex_retire_order(const void *left, const void *right) {
+    const tex_retire_candidate *a = left, *b = right;
+    if (a->age != b->age) return a->age > b->age ? -1 : 1;
+    return a->slot < b->slot ? -1 : a->slot != b->slot;
+}
+
 static int tex_index_ready;
 
 static u32 tex_bucket(u64 key) { return (u32)((key * 0x9E3779B97F4A7C15ull) >> 52); }
@@ -128,7 +141,7 @@ static u64 stat_tex_recycled;
 static pthread_mutex_t list_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t gpu_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  list_cv = PTHREAD_COND_INITIALIZER;
-static int frame_requested, frame_done = 1, renderer_running;
+static int frame_requested, frame_done = 1, renderer_running, frame_rendering;
 int ps2_vk_lockstep;
 static volatile int window_closed;
 static volatile int swap_dirty;
@@ -143,6 +156,9 @@ static int want_fullscreen;
 static u32 present_x, present_y, present_w = 640, present_h = 448;
 static u32 present_rt;
 static int present_blank;
+typedef struct { u32 x,y,w,h,rt; int blank; } vk_present_state;
+/* Published under list_lock; renderer state changes only with its draw list. */
+static vk_present_state pub_present = {0,0,640,448,0,0};
 static u32 debug_solid;
 static u64 trace_frame;
 
@@ -297,7 +313,7 @@ typedef struct {
 static mesh_arena slot_mesh[LIST_SLOTS];
 static mesh_arena *rec_mesh, *pub_mesh, *rep_mesh;
 static int mesh_ok;
-static u64 stat_mesh_draws, stat_mesh_overflow, stat_mesh_mat;
+static u64 stat_mesh_draws, stat_mesh_overflow, stat_mesh_mat, stat_mesh_blocks_reused;
 static ps2_vk_vertex *pub_verts;
 static vk_draw       *pub_draws;
 static u32            pub_nverts, pub_ndraws;
@@ -310,7 +326,7 @@ static u32 rep_nverts, rep_ndraws;
 
 typedef struct {
     VkCommandBuffer cmd;
-    VkSemaphore acquired, rendered;
+    VkSemaphore acquired;
     VkFence fence;
     VkQueryPool timing_queries;
     int timing_pending;
@@ -344,6 +360,8 @@ static VkSwapchainKHR swapchain;
 static VkFormat swap_format;
 static VkExtent2D swap_extent;
 static VkImage swap_images[8];
+/* Present waits belong to acquired images, not CPU frame slots. */
+static VkSemaphore swap_rendered[8];
 static VkImageView swap_views[8];
 static u32 swap_count;
 static VkCommandPool cmdpool;
@@ -377,6 +395,7 @@ typedef struct {
     VkImageLayout dlayout;
 } vk_target;
 static vk_target rts[RT_SLOTS];
+static vk_target ov_comp,ov_display;
 static u32 rt_w = 640, rt_h = 448;
 #define RT_SCALE_MAX 8u
 static u32 rt_scale = 1;
@@ -411,6 +430,7 @@ static vk_target *cur_zt;
 static VkSampler sampler;
 static VkSampler sampler_point;
 static VkSampler sampler_mip;
+static VkSampler sampler_mip_clamp[4];
 static int sampler_aniso;
 static float max_aniso;
 static VkDescriptorSet white_set;
@@ -460,6 +480,7 @@ static void *swap_ptr;
 static u32 swap_w, swap_h;
 
 static VkPhysicalDeviceMemoryProperties memprops;
+static int memory_budget_enabled;
 static int vk_ready;
 static int rendering_open;
 
@@ -546,6 +567,24 @@ static int make_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
     return 0;
 }
 
+static void image_create_info(VkImageCreateInfo *ii,u32 w,u32 h,VkFormat fmt,
+                              VkImageUsageFlags usage) {
+    memset(ii, 0, sizeof(*ii));
+    ii->sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ii->imageType = VK_IMAGE_TYPE_2D;
+    ii->format = fmt;
+    ii->extent.width = w;
+    ii->extent.height = h;
+    ii->extent.depth = 1;
+    ii->mipLevels = 1;
+    ii->arrayLayers = 1;
+    ii->samples = VK_SAMPLE_COUNT_1_BIT;
+    ii->tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii->usage = usage;
+    ii->sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ii->initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+}
+
 static int make_image_direct(u32 w, u32 h, VkFormat fmt, VkImageUsageFlags usage,
                       VkImageAspectFlags aspect, VkImage *img,
                       VkDeviceMemory *mem, VkImageView *view) {
@@ -560,20 +599,7 @@ static int make_image_direct(u32 w, u32 h, VkFormat fmt, VkImageUsageFlags usage
     *img = VK_NULL_HANDLE;
     *mem = VK_NULL_HANDLE;
     *view = VK_NULL_HANDLE;
-    memset(&ii, 0, sizeof(ii));
-    ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    ii.imageType = VK_IMAGE_TYPE_2D;
-    ii.format = fmt;
-    ii.extent.width = w;
-    ii.extent.height = h;
-    ii.extent.depth = 1;
-    ii.mipLevels = 1;
-    ii.arrayLayers = 1;
-    ii.samples = VK_SAMPLE_COUNT_1_BIT;
-    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ii.usage = usage;
-    ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    image_create_info(&ii,w,h,fmt,usage);
     if ((r = vkCreateImage(dev, &ii, NULL, &ti)) != VK_SUCCESS) goto fail;
     li = ti;
     vkGetImageMemoryRequirements(dev, li, &req);
@@ -623,7 +649,24 @@ static struct {
     VkImageView view;
 } warm_images[WARM_IMAGE_MAX];
 static u32 warm_image_n, warm_w, warm_h, warm_scale;
+static u32 warm_window_w,warm_window_h;
 static u64 warm_image_hits;
+static int warm_multiscale;
+static u32 window_cover_scale(u32,u32,u32,u32);
+static int full_output_resolution(void);
+
+/* Keep the original reserved byte budget when preparing larger images. */
+static void warm_image_budget(u32 base,u32 target,int *pairs,int *snapshots) {
+    if(!base || target<=base)return;
+    u64 old_area=(u64)base*base,new_area=(u64)target*target;
+    *pairs=(int)((u64)*pairs*old_area/new_area);
+    *snapshots=(int)((u64)*snapshots*old_area/new_area);
+}
+static int warm_layout_matches(u32 w,u32 h,u32 scale) {
+    return w==warm_w && h==warm_h
+        && (!warm_multiscale || (swap_extent.width==warm_window_w && swap_extent.height==warm_window_h))
+        && (warm_multiscale ? scale<=warm_scale : scale==warm_scale);
+}
 static void warm_images_release(void) {
     for(u32 i=0;i<warm_image_n;i++) {
         if(!warm_images[i].image)continue;
@@ -645,7 +688,14 @@ static int make_image(u32 w,u32 h,VkFormat fmt,VkImageUsageFlags usage,
             warm_image_hits++;return 0;
         }
     }
-    return make_image_direct(w,h,fmt,usage,aspect,image,memory,view);
+    int result=make_image_direct(w,h,fmt,usage,aspect,image,memory,view);
+    if(result && warm_image_n) {
+        /* All entries are unused and have no GPU references. Give their
+         * reservation back before allowing ordinary allocation to fail. */
+        warm_images_release();
+        result=make_image_direct(w,h,fmt,usage,aspect,image,memory,view);
+    }
+    return result;
 }
 static int warm_image_add(u32 w,u32 h,VkFormat fmt,VkImageUsageFlags usage,
     VkImageAspectFlags aspect) {
@@ -657,14 +707,107 @@ static int warm_image_add(u32 w,u32 h,VkFormat fmt,VkImageUsageFlags usage,
     warm_images[i].usage=usage;warm_images[i].aspect=aspect;
     warm_image_n++;return 0;
 }
+/* Budget estimates include other applications' pressure. Never infer free
+ * VRAM from the physical heap size; unsupported/unknown budgets keep the small
+ * original reserve. No image is aliased and no guest framebuffer is invented. */
+static u64 warm_heap_available(u32 heap) {
+    if(!memory_budget_enabled || heap>=memprops.memoryHeapCount)return 0;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget={0};
+    VkPhysicalDeviceMemoryProperties2 props={0};
+    budget.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    props.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+    props.pNext=&budget;
+    vkGetPhysicalDeviceMemoryProperties2(phys,&props);
+    u64 cap=budget.heapBudget[heap],used=budget.heapUsage[heap];
+    return cap>used ? cap-used : 0;
+}
+static int warm_loading_plan(u64 available,const u64 cost[5],int pairs,int snaps) {
+    const u64 headroom=2ull<<30,cap=8ull<<30;
+    if(pairs<1 || pairs>28 || snaps<0 || snaps>8 || 2*pairs+snaps+5>64)return 0;
+    if(!cost[0] || !cost[1] || !cost[2] || !cost[3] || !cost[4])return 0;
+    /* Counts and single-image sizes are bounded before multiplication. */
+    for(u32 i=0;i<5;i++)if(cost[i]>cap)return 0;
+    u64 bytes=(u64)pairs*(cost[0]+cost[1])+(u64)snaps*cost[2]+cost[0]+cost[2]+2*cost[3]+cost[4];
+    u64 allowance=available/2;
+    if(allowance>cap)allowance=cap;
+    return available>headroom && bytes<=allowance && bytes<=available-headroom;
+}
+/* Extra native composition images observed during briefing -> flight:
+ * one color target, one snapshot, two attachment-only depths and one sampled
+ * color with transfer-source usage. Usage bits must match, not just formats. */
+static const VkFormat loading_formats[5]={VK_FORMAT_R8G8B8A8_UNORM,VK_FORMAT_D32_SFLOAT,
+    VK_FORMAT_R8G8B8A8_UNORM,VK_FORMAT_D32_SFLOAT,VK_FORMAT_R8G8B8A8_UNORM};
+static const VkImageUsageFlags loading_usages[5]={
+    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|
+        VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|
+        VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+    VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
+static int warm_loading_capacity(u32 w,u32 h,u64 cost[5],u32 *heap) {
+    if(!memory_budget_enabled)return 0;
+    for(u32 i=0;i<5;i++) {
+        VkImageCreateInfo ii;
+        VkDeviceImageMemoryRequirements di={0};
+        VkMemoryRequirements2 req={0};
+        image_create_info(&ii,w,h,loading_formats[i],loading_usages[i]);
+        di.sType=VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS;di.pCreateInfo=&ii;
+        req.sType=VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
+        vkGetDeviceImageMemoryRequirements(dev,&di,&req);
+        u32 type=find_mem(req.memoryRequirements.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if(type>=memprops.memoryTypeCount || !(req.memoryRequirements.memoryTypeBits&(1u<<type))
+            || !(memprops.memoryTypes[type].propertyFlags&VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))return 0;
+        u32 hidx=memprops.memoryTypes[type].heapIndex;
+        if(i && hidx!=*heap)return 0;
+        *heap=hidx;cost[i]=req.memoryRequirements.size;
+    }
+    return 1;
+}
+
 static void warm_native_images(void) {
     const char *e=getenv("PS2_IMAGE_PREWARM");
     int count=e ? atoi(e) : 0;
     if(count<1 || count>28)return;
-    warm_w=rt_w;warm_h=rt_h;warm_scale=rt_scale;
-    u32 w=rt_w*rt_scale,h=rt_h*rt_scale;
+    const char *snap_env=getenv("PS2_SNAPSHOT_PREWARM");
+    int snapshots=snap_env ? atoi(snap_env) : 4;
+    if(snapshots<0)snapshots=0;
+    if(snapshots>WARM_IMAGE_MAX-2*count)snapshots=WARM_IMAGE_MAX-2*count;
+    int requested_pairs=count,requested_snaps=snapshots,loading=0;
+    u32 loading_heap=0;u64 loading_cost[5]={0};
+    warm_w=rt_w;warm_h=rt_h;warm_scale=rt_scale;warm_multiscale=0;
+    warm_window_w=swap_extent.width;warm_window_h=swap_extent.height;
+    const char *fixed=getenv("PS2_UPSCALE");
+    int want=fixed&&*fixed?atoi(fixed):ps2_cfg.internal_res;
+    if(PS2_GAME_AC4 && want<=0 && full_output_resolution()) {
+        /* Flight uses a 512x448 crop; menus/movies can use 640 pixels.
+         * Keep the larger reservation across those expected scale changes. */
+        u32 target=window_cover_scale(swap_extent.width,swap_extent.height,512u,448u);
+        u32 big=rt_w>rt_h?rt_w:rt_h,limit=max_image_dim/(big?big:1u);
+        if(target>limit)target=limit;
+        if(target<rt_scale)target=rt_scale;
+        /* Startup can already be at the stable flight scale. Keep the old
+         * height-based reservation budget rather than multiplying its VRAM. */
+        u32 budget_scale=(swap_extent.height+447u)/448u;
+        if(budget_scale<1u)budget_scale=1u;
+        if(budget_scale>rt_scale)budget_scale=rt_scale;
+        warm_image_budget(budget_scale,target,&count,&snapshots);
+        warm_scale=target;warm_multiscale=1;
+    }
+    u32 w=rt_w*warm_scale,h=rt_h*warm_scale;
+    const char *loading_env=getenv("PS2_LOADING_PREWARM");
+    if(PS2_GAME_AC4 && want<=0 && full_output_resolution() && (!loading_env || atoi(loading_env)!=0)
+        && warm_loading_capacity(w,h,loading_cost,&loading_heap)) {
+        u64 available=warm_heap_available(loading_heap);
+        if(warm_loading_plan(available,loading_cost,requested_pairs,requested_snaps)) {
+            count=requested_pairs;snapshots=requested_snaps;loading=1;
+            ps2_log("vk: loading reserve: budget headroom %.1f MiB; preparing %d target pairs, %d snapshots and five native composition images before guest startup",
+                available/1048576.0,count,snapshots);
+        }
+    }
     u64 start=vk_mono_ns();
     for(int i=0;i<count;i++) {
+        if(loading && warm_heap_available(loading_heap)<(2ull<<30)+loading_cost[0]+loading_cost[1])break;
         if(warm_image_add(w,h,VK_FORMAT_R8G8B8A8_UNORM,
             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|
             VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -674,16 +817,20 @@ static void warm_native_images(void) {
             VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT,
             VK_IMAGE_ASPECT_DEPTH_BIT)!=0)break;
     }
-    /* Snapshot images are distinct from color/depth attachments. Reserve
-     * only the configured demand, bounded by the same fixed pool capacity. */
-    const char *snap_env=getenv("PS2_SNAPSHOT_PREWARM");
-    int snapshots=snap_env ? atoi(snap_env) : 4;
-    if(snapshots<0)snapshots=0;
-    if(snapshots>WARM_IMAGE_MAX-2*count)snapshots=WARM_IMAGE_MAX-2*count;
-    for(int i=0;i<snapshots;i++)
+    for(int i=0;i<snapshots;i++) {
+        if(loading && warm_heap_available(loading_heap)<(2ull<<30)+loading_cost[2])break;
         if(warm_image_add(w,h,VK_FORMAT_R8G8B8A8_UNORM,
             VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT,
             VK_IMAGE_ASPECT_COLOR_BIT)!=0)break;
+    }
+    if(loading) {
+        static const int extra[5]={1,0,1,2,1};
+        for(u32 kind=0;kind<5;kind++)for(int i=0;i<extra[kind];i++) {
+            if(warm_heap_available(loading_heap)<(2ull<<30)+loading_cost[kind])break;
+            if(warm_image_add(w,h,loading_formats[kind],loading_usages[kind],
+                loading_formats[kind]==VK_FORMAT_D32_SFLOAT?VK_IMAGE_ASPECT_DEPTH_BIT:VK_IMAGE_ASPECT_COLOR_BIT)!=0)break;
+        }
+    }
     ps2_log("vk: prewarmed %u unused %ux%u images in %.2f ms before guest startup",
         warm_image_n,w,h,(vk_mono_ns()-start)/1e6);
 }
@@ -1318,6 +1465,24 @@ static VkPresentModeKHR pick_present_mode(void) {
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 
+/* Caller has drained GPU work before recreating the swapchain. Build the
+ * complete new semaphore pool before replacing the old pool on success. */
+static int create_present_semaphores(u32 count) {
+    VkSemaphore fresh[8]={0};
+    VkSemaphoreCreateInfo ci={0};
+    ci.sType=VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    if(!count || count>8u)return 1;
+    for(u32 i=0;i<count;i++) {
+        if(vkCreateSemaphore(dev,&ci,NULL,&fresh[i])!=VK_SUCCESS) {
+            for(u32 j=0;j<i;j++)vkDestroySemaphore(dev,fresh[j],NULL);
+            return 1;
+        }
+    }
+    for(u32 i=0;i<8u;i++)if(swap_rendered[i])vkDestroySemaphore(dev,swap_rendered[i],NULL);
+    memcpy(swap_rendered,fresh,sizeof fresh);
+    return 0;
+}
+
 static int create_swapchain(void) {
     VkSurfaceCapabilitiesKHR caps;
     VkSwapchainCreateInfoKHR ci;
@@ -1366,6 +1531,7 @@ static int create_swapchain(void) {
     }
     swap_count = 8;
     VKCHK(vkGetSwapchainImagesKHR(dev, swapchain, &swap_count, swap_images));
+    if(create_present_semaphores(swap_count))return 1;
     ps2_ui_swapchain_changed(swap_count);
     for (u32 i = 0; i < swap_count; i++) {
         VkImageViewCreateInfo vi;
@@ -1397,8 +1563,33 @@ static VkResult make_linear_sampler(VkSampler *out, int aniso) {
         sci.anisotropyEnable = VK_TRUE;
         sci.maxAnisotropy = (float)aniso < max_aniso ? (float)aniso : max_aniso;
     }
-    sampler_aniso = aniso;
     return vkCreateSampler(dev, &sci, NULL, out);
+}
+
+/* Build all native wrap variants before replacing any live descriptor. */
+static VkResult make_mip_samplers(VkSampler out[4],int aniso) {
+    VkSamplerCreateInfo ms={0};
+    ms.sType=VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    ms.magFilter=ms.minFilter=VK_FILTER_LINEAR;
+    ms.mipmapMode=VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    ms.addressModeW=VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    ms.maxLod=VK_LOD_CLAMP_NONE;
+    if(aniso>=2 && max_aniso>=2.0f) {
+        ms.anisotropyEnable=VK_TRUE;
+        ms.maxAnisotropy=fminf((float)aniso,max_aniso);
+    }
+    for(u32 i=0;i<4;i++)out[i]=VK_NULL_HANDLE;
+    for(u32 mask=0;mask<4;mask++) {
+        ms.addressModeU=mask&1u?VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE:VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        ms.addressModeV=mask&2u?VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE:VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        VkResult result=vkCreateSampler(dev,&ms,NULL,&out[mask]);
+        if(result!=VK_SUCCESS) {
+            for(u32 j=0;j<mask;j++)vkDestroySampler(dev,out[j],NULL);
+            for(u32 j=0;j<4;j++)out[j]=VK_NULL_HANDLE;
+            return result;
+        }
+    }
+    return VK_SUCCESS;
 }
 
 static VkDescriptorSet alloc_set_s(VkImageView view, VkSampler smp) {
@@ -1453,21 +1644,73 @@ static void rebind_set(VkDescriptorSet set, VkImageView view) {
 }
 
 static void apply_sampler_settings(void) {
-    VkSampler fresh, old = sampler;
-    if (ps2_cfg.anisotropy == sampler_aniso) return;
-    if (make_linear_sampler(&fresh, ps2_cfg.anisotropy) != VK_SUCCESS) return;
-    vkDeviceWaitIdle(dev);
-    sampler = fresh;
-    rebind_set(white_set, white_view);
-    for (u32 i = 0; i < ntextures && i < VK_MAX_TEXTURES; i++)
-        rebind_set(textures[i].set, textures[i].view);
-    for (u32 k = 0; k < RT_SLOTS; k++) {
-        if (!rts[k].created) continue;
-        rebind_set(rts[k].set, rts[k].cview);
-        rebind_set(rts[k].sset, rts[k].sview);
+    VkSampler fresh=VK_NULL_HANDLE,old=sampler,mips[4],old_mips[4];
+    if(ps2_cfg.anisotropy==sampler_aniso)return;
+    if(make_linear_sampler(&fresh,ps2_cfg.anisotropy)!=VK_SUCCESS)return;
+    if(make_mip_samplers(mips,ps2_cfg.anisotropy)!=VK_SUCCESS) {
+        vkDestroySampler(dev,fresh,NULL);return;
     }
-    vkDestroySampler(dev, old, NULL);
-    ps2_log("vk: anisotropic filtering %dx", sampler_aniso >= 2 ? sampler_aniso : 0);
+    if(vkDeviceWaitIdle(dev)!=VK_SUCCESS) {
+        vkDestroySampler(dev,fresh,NULL);
+        for(u32 i=0;i<4;i++)vkDestroySampler(dev,mips[i],NULL);
+        return;
+    }
+    memcpy(old_mips,sampler_mip_clamp,sizeof old_mips);
+    memcpy(sampler_mip_clamp,mips,sizeof mips);
+    sampler=fresh;sampler_mip=mips[0];sampler_aniso=ps2_cfg.anisotropy;
+    rebind_set(white_set,white_view);
+    for(u32 i=0;i<ntextures && i<VK_MAX_TEXTURES;i++) {
+        vk_texture *t=&textures[i];
+        rebind_set_s(t->set,t->view,t->levels>1u?mips[t->native_clamp&3u]:sampler);
+    }
+    for(u32 k=0;k<RT_SLOTS;k++) {
+        if(!rts[k].created)continue;
+        rebind_set(rts[k].set,rts[k].cview);
+        rebind_set(rts[k].sset,rts[k].sview);
+    }
+    if(ov_comp.created) {
+        rebind_set(ov_comp.set,ov_comp.cview);
+        rebind_set(ov_comp.sset,ov_comp.sview);
+    }
+    if(ov_display.created)rebind_set(ov_display.set,ov_display.cview);
+    vkDestroySampler(dev,old,NULL);
+    for(u32 i=0;i<4;i++)vkDestroySampler(dev,old_mips[i],NULL);
+    ps2_log("vk: anisotropic filtering %dx",sampler_aniso>=2?sampler_aniso:0);
+}
+
+int ps2_vk_set_anisotropy(int value) {
+    if(!vk_ready || (value!=0 && value!=2 && value!=4 && value!=8 && value!=16))return 0;
+    pthread_mutex_lock(&gpu_lock);
+    int previous=ps2_cfg.anisotropy;
+    ps2_cfg.anisotropy=value;
+    apply_sampler_settings();
+    int applied=sampler_aniso==value;
+    if(!applied)ps2_cfg.anisotropy=previous;
+    pthread_mutex_unlock(&gpu_lock);
+    return applied;
+}
+
+static int window_hidden;
+static int test_skip_present;
+int ps2_vk_test_skip_next_present(void) {
+    if(!vk_ready || !window_hidden)return 0;
+    pthread_mutex_lock(&gpu_lock);
+    test_skip_present=1;
+    pthread_mutex_unlock(&gpu_lock);
+    return 1;
+}
+int ps2_vk_test_resize_window(int width,int height) {
+    if(!vk_ready || !window || !window_hidden || width<320 || width>7680 || height<240 || height>4320)return 0;
+    pthread_mutex_lock(&gpu_lock);
+    int ok=vkDeviceWaitIdle(dev)==VK_SUCCESS;
+    if(ok)ok=SDL_SetWindowSize(window,width,height) && SDL_SyncWindow(window);
+    if(ok)ok=create_swapchain()==0;
+    if(ok) {
+        ps2_cfg.window_w=width;ps2_cfg.window_h=height;swap_dirty=0;
+        ps2_log("vk: replay window resized: requested %dx%d, drawable %ux%u",width,height,swap_extent.width,swap_extent.height);
+    }
+    pthread_mutex_unlock(&gpu_lock);
+    return ok;
 }
 
 static void destroy_target_images(vk_target *t) {
@@ -1651,7 +1894,7 @@ static int create_targets(u32 w, u32 h, u32 scale) {
     if (h < rt_h) h = rt_h;
     if (scale < 1) scale = 1;
     if (rts[0].created && w == rt_w && h == rt_h && scale == rt_scale) return 0;
-    if(warm_image_n && (w!=warm_w || h!=warm_h || scale!=warm_scale))
+    if(warm_image_n && !warm_layout_matches(w,h,scale))
         warm_images_release();
     if (!rts[0].created) {
         rt_w = w;
@@ -1713,7 +1956,8 @@ static int vk_init(void) {
     VkQueueFamilyProperties qprops[16];
     const char *const *sdl_exts;
     Uint32 nsdl = 0;
-    const char *dev_exts[1] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+    const char *dev_exts[2] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+    u32 dev_ext_count=1;
     float prio = 1.0f;
     VkDescriptorPoolSize psz;
     VkDescriptorPoolCreateInfo pci;
@@ -1773,6 +2017,21 @@ static int vk_init(void) {
                 VK_VERSION_PATCH(pr.apiVersion));
     }
     vkGetPhysicalDeviceMemoryProperties(phys, &memprops);
+    {
+        u32 count=0;
+        memory_budget_enabled=0;
+        if(vkEnumerateDeviceExtensionProperties(phys,NULL,&count,NULL)==VK_SUCCESS && count) {
+            VkExtensionProperties *ext=calloc(count,sizeof(*ext));
+            if(ext && vkEnumerateDeviceExtensionProperties(phys,NULL,&count,ext)==VK_SUCCESS)
+                for(u32 i=0;i<count;i++)
+                    if(!strcmp(ext[i].extensionName,VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
+                        memory_budget_enabled=1;break;
+                    }
+            free(ext);
+        }
+        if(memory_budget_enabled)dev_exts[dev_ext_count++]=VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+    }
+
 
     nq = 16;
     vkGetPhysicalDeviceQueueFamilyProperties(phys, &nq, qprops);
@@ -1838,7 +2097,7 @@ static int vk_init(void) {
     dci.pNext = &f2;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = 1;
+    dci.enabledExtensionCount = dev_ext_count;
     dci.ppEnabledExtensionNames = dev_exts;
     VKCHK(vkCreateDevice(phys, &dci, NULL, &dev));
     vkGetDeviceQueue(dev, qfamily, 0, &queue);
@@ -1923,23 +2182,11 @@ static int vk_init(void) {
     sci.minFilter = VK_FILTER_NEAREST;
     VKCHK(vkCreateSampler(dev, &sci, NULL, &sampler_point));
     VKCHK(make_linear_sampler(&sampler, ps2_cfg.anisotropy));
-    {   VkSamplerCreateInfo ms;
-        memset(&ms, 0, sizeof(ms));
-        ms.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-        ms.magFilter = VK_FILTER_LINEAR;
-        ms.minFilter = VK_FILTER_LINEAR;
-        ms.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-        ms.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        ms.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        ms.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        ms.maxLod = VK_LOD_CLAMP_NONE;
-        if (max_aniso >= 2.0f) {
-            float want = ps2_cfg.anisotropy >= 2 ? (float)ps2_cfg.anisotropy : 16.0f;
-            ms.anisotropyEnable = VK_TRUE;
-            ms.maxAnisotropy = want < max_aniso ? want : max_aniso;
-        }
-        VKCHK(vkCreateSampler(dev, &ms, NULL, &sampler_mip));
-    }
+    sampler_aniso=ps2_cfg.anisotropy;
+    VKCHK(make_mip_samplers(sampler_mip_clamp,ps2_cfg.anisotropy));
+    sampler_mip=sampler_mip_clamp[0];
+    ps2_log("vk: native mip sampler anisotropy %.1fx",
+        ps2_cfg.anisotropy>=2 && max_aniso>=2.0f?fminf((float)ps2_cfg.anisotropy,max_aniso):1.0f);
 
     snprintf(spv, sizeof(spv), "%s/gs.vert.spv", base);
     gs_vs = load_spv(spv);
@@ -1989,7 +2236,6 @@ static int vk_init(void) {
         memset(&si, 0, sizeof(si));
         si.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
         VKCHK(vkCreateSemaphore(dev, &si, NULL, &frames[i].acquired));
-        VKCHK(vkCreateSemaphore(dev, &si, NULL, &frames[i].rendered));
         memset(&fi, 0, sizeof(fi));
         fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
@@ -2535,7 +2781,8 @@ static void reserve_texture_staging(vk_frame *fr) {
         u32 ti = rep_draws[i].tex;
         if (ti >= ntextures || seen[ti]) continue;
         seen[ti] = 1;
-        need += ((size_t)textures[ti].w * textures[ti].h * 4u + 255u)
+        need += ((textures[ti].native_mips ? textures[ti].native_mip_bytes
+                 : (size_t)textures[ti].w * textures[ti].h * 4u) + 255u)
                 & ~(size_t)255u;
     }
     if (need <= cap) return;
@@ -2559,14 +2806,15 @@ static void reserve_texture_staging(vk_frame *fr) {
 }
 
 static void upload_texture_mips(VkCommandBuffer cmd, vk_frame *fr, vk_texture *t) {
-    size_t bytes = (size_t)t->w * t->h * 4u;
+    size_t bytes = t->native_mips ? t->native_mip_bytes : (size_t)t->w * t->h * 4u;
     u32 gen = __atomic_load_n(&t->generation, __ATOMIC_ACQUIRE);
     VkBufferImageCopy region;
     if (fr->soff + bytes > fr->scap) return;
     if (!t->image) {
         if (make_tex_image(t, t->levels) != 0) return;
-        if (t->set) rebind_set_s(t->set, t->view, sampler_mip);
-        else t->set = alloc_set_s(t->view, sampler_mip);
+        VkSampler mip_sampler = sampler_mip_clamp[t->native_clamp & 3u];
+        if (t->set) rebind_set_s(t->set, t->view, mip_sampler);
+        else t->set = alloc_set_s(t->view, mip_sampler);
         barrier_levels(cmd, t->image, 0, t->levels,
                        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
@@ -2577,6 +2825,25 @@ static void upload_texture_mips(VkCommandBuffer cmd, vk_frame *fr, vk_texture *t
                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT,
                        VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    }
+    if (t->native_mips) {
+        VkBufferImageCopy copies[7] = {0};size_t offset=0;
+        memcpy((u8 *)fr->sptr+fr->soff,t->native_mips,bytes);
+        for(u32 lv=0;lv<t->levels;lv++) {
+            copies[lv].bufferOffset=fr->soff+offset;
+            copies[lv].imageSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;
+            copies[lv].imageSubresource.mipLevel=lv;
+            copies[lv].imageSubresource.layerCount=1;
+            copies[lv].imageExtent=(VkExtent3D){t->w>>lv,t->h>>lv,1};
+            offset+=(size_t)(t->w>>lv)*(t->h>>lv)*4u;
+        }
+        vkCmdCopyBufferToImage(cmd,fr->sbuf,t->image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,t->levels,copies);
+        fr->soff+=(bytes+255u)&~(size_t)255u;
+        barrier_levels(cmd,t->image,0,t->levels,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT,VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,VK_ACCESS_2_SHADER_READ_BIT);
+        if (__atomic_load_n(&t->generation,__ATOMIC_ACQUIRE)==gen)t->uploaded_gen=(int)gen;
+        stat_texuploads++;return;
     }
     memcpy((u8 *)fr->sptr + fr->soff, __atomic_load_n(&t->rgba, __ATOMIC_ACQUIRE), bytes);
     memset(&region, 0, sizeof(region));
@@ -3164,12 +3431,20 @@ static int ov_accum;
 static u8 *ov_eligible;
 static int ov_on = -1;
 static int ov_list_log = -1;
-static vk_target ov_comp;
+static int ov_precompose = -1;
+static int ov_display_fallback = -1;
+
+static u32 ov_display_k, ov_display_w, ov_display_h;
+static int ov_display_show, ov_display_presented, ov_display_ready;
 static u32 ov_k, ov_cw, ov_ch;
 static int ov_show;
 static int ov_seen;
 static int ov_presented;
 static u64 stat_ov_frames, stat_ov_draws, stat_ov_inplace, stat_ov_rgbreads;
+static u64 stat_ov_precomposed;
+static u64 stat_ov_display_copies, stat_ov_display_presented;
+static u64 stat_ov_masks, stat_ov_mask_bytes;
+
 
 static int ov_enabled(void) {
     if (ov_on < 0) {
@@ -3187,7 +3462,7 @@ static int ov_enabled(void) {
 }
 
 static int ov_is_composite(const vk_draw *d) {
-    return d->tex_rt == 1u && !d->tex_depth && d->rt != 0u && d->rt == present_rt;
+    return d->tex_rt == PS2_VK_2D_SCENE_RT + 1u && !d->tex_depth && d->rt != PS2_VK_2D_SCENE_RT && d->rt == present_rt;
 }
 
 #define OV_CELL 16
@@ -3196,6 +3471,20 @@ static int ov_is_composite(const vk_draw *d) {
 static u8 ov_grid[OV_CH][OV_CW];
 #define OV_HOLD 30u
 static u64 ov_hold[OV_CH][OV_CW];
+
+void ps2_vk_replay_overlay_reset(void) {
+    if(!vk_ready)return;
+    ps2_vk_drain();
+    pthread_mutex_lock(&gpu_lock);
+    for(u32 i=0;i<2;i++) {
+        ov_lists[i].nd=ov_lists[i].nv=0;ov_lists[i].overflow=0;
+    }
+    memset(ov_hold,0,sizeof ov_hold);
+    memset(ov_grid,0,sizeof ov_grid);
+    ov_accum=ov_show=ov_seen=ov_presented=0;
+    ov_display_show=ov_display_presented=ov_display_ready=0;
+    pthread_mutex_unlock(&gpu_lock);
+}
 
 static int ov_held(s32 x0, s32 y0, s32 x1, s32 y1) {
     for (s32 y = y0; y <= y1; y++)
@@ -3299,16 +3588,29 @@ static int ov_hit(s32 x0, s32 y0, s32 x1, s32 y1, int additive) {
 static int ov_safe(const vk_draw *d) {
     u32 dk = d->depth;
     if (d->native && d->native != PS2_VK_NATIVE_2D && !screen_mesh_rec(d, 0)) return 0;
-    if (d->clut_rt || d->tex_self || d->tex_rt == 1u || d->date || (d->frag_flags & (1u << 30))) return 0;
+    if (d->clut_rt || d->tex_self || d->tex_rt == PS2_VK_2D_SCENE_RT + 1u || d->date || (d->frag_flags & (1u << 30))) return 0;
     if ((d->blend & 0x100u) && ((d->blend >> 4) & 3u) == 1u) return 0;
     if ((dk >> 9) & 3u) return 0;
     if ((dk & 3u) != 1u) return 0;
     return 1;
 }
 
+/* DATE is only eligible in the ordered tail, never in reordered early groups.
+ * Its snapshot must already exist before removing any original GS draws. */
+static int ov_mask_tail(const vk_draw *d) {
+    static int enabled = -1;
+    vk_draw plain;
+    if (!PS2_GAME_AC4 || !vk_env_flag("PS2_AC4_SCREEN_MASK", &enabled)
+        || !vk_env_flag("PS2_AC4_SCREEN_PRECOMPOSE", &ov_precompose)
+        || !ov_comp.snap || !ov_comp.sset) return 0;
+    plain = *d;
+    plain.date = 0;
+    return ov_safe(&plain);
+}
+
 static int ov_reads_slot0_rgb(const vk_draw *d) {
     u32 tfx = d->frag_flags & 3u;
-    if (d->tex_rt != 1u || d->tex_depth) return 0;
+    if (d->tex_rt != PS2_VK_2D_SCENE_RT + 1u || d->tex_depth) return 0;
     if (!((d->depth >> 3) & 1u)) return 0;
     if (((d->depth >> 5) & 7u) == 7u) return 0;
     if (d->native == PS2_VK_NATIVE_MESH) {
@@ -3330,6 +3632,13 @@ static int ov_reads_slot0_rgb(const vk_draw *d) {
     return 0;
 }
 
+static int ov_single_composite(void) {
+    u32 transfers = 0;
+    for (u32 i = 0; i < rep_ndraws; i++)
+        if (ov_is_composite(&rep_draws[i]) && ++transfers > 1u) return 0;
+    return 1;
+}
+
 static void ov_scan(void) {
     static int log_left = -1;
     u32 seg_end = rep_ndraws;
@@ -3338,13 +3647,19 @@ static void ov_scan(void) {
         log_left = e ? atoi(e) : 0;
     }
     memset(ov_eligible, 0, rep_ndraws);
+    if (PS2_GAME_AC4 && vk_env_flag("PS2_AC4_SCREEN_PRECOMPOSE", &ov_precompose)) {
+        /* The overlay vertex buffer has one immutable upload per field.
+         * Retain this field's HUD in GS when several copies would reuse it.
+         * A pending list from the preceding field can still compose once. */
+        if (!ov_single_composite()) return;
+    }
     while (seg_end > 0) {
         u32 seg_start = seg_end, first2d = ~0u;
         int tail = 1;
         while (seg_start > 0 && !ov_is_composite(&rep_draws[seg_start - 1]))
             seg_start--;
         for (u32 i = seg_start; i < seg_end; i++)
-            if (rep_draws[i].native == PS2_VK_NATIVE_2D && rep_draws[i].rt == 0u) {
+            if (rep_draws[i].native == PS2_VK_NATIVE_2D && rep_draws[i].rt == PS2_VK_2D_SCENE_RT) {
                 first2d = i;
                 break;
             }
@@ -3355,7 +3670,7 @@ static void ov_scan(void) {
                 const vk_draw *d = &rep_draws[i];
                 int is2d = d->native == PS2_VK_NATIVE_2D;
                 s32 x0, y0, x1, y1;
-                if (d->rt != 0u) {
+                if (d->rt != PS2_VK_2D_SCENE_RT) {
                     if (ov_reads_slot0_rgb(d)) {
                         tail = 0;
                         memset(ov_grid, 1, sizeof ov_grid);
@@ -3363,9 +3678,9 @@ static void ov_scan(void) {
                     }
                     continue;
                 }
-                if (!is2d && ov_colourless(d)) continue;
+                if (!is2d && ov_colourless(d) && !ov_mask_tail(d)) continue;
                 ov_bbox(d, &x0, &y0, &x1, &y1);
-                if (tail && ov_safe(d) && !(is2d && ov_held(x0, y0, x1, y1))) {
+                if (tail && (ov_safe(d) || ov_mask_tail(d)) && !(is2d && ov_held(x0, y0, x1, y1))) {
                     ov_eligible[i] = 1;
                     continue;
                 }
@@ -3386,7 +3701,7 @@ static void ov_scan(void) {
                 if (is2d && (!ov_safe(d) || ov_hit(x0, y0, x1, y1, ov_additive(d))))
                     ov_hold_mark(x0, y0, x1, y1);
                 if (is2d) stat_ov_inplace++;
-                if (d->tex_rt == 1u) memset(ov_grid, 1, sizeof ov_grid);
+                if (d->tex_rt == PS2_VK_2D_SCENE_RT + 1u) memset(ov_grid, 1, sizeof ov_grid);
                 else ov_mark(x0, y0, x1, y1, ov_additive(d));
             }
         }
@@ -3395,19 +3710,25 @@ static void ov_scan(void) {
     {
         static int init;
         static s32 rx0, ry0, rx1, ry1;
-        static int frames_left;
+        static int frames_left, detail;
         if (!init) {
             const char *e = getenv("PS2_RN_OV_REGION");
+            const char *d = getenv("PS2_RN_OV_DETAIL");
             init = 1;
+            detail = d && !strcmp(d, "1");
             if (e && sscanf(e, "%d,%d,%d,%d", &rx0, &ry0, &rx1, &ry1) == 4) frames_left = 600;
         }
         if (frames_left > 0) {
-            u32 lifted = 0, inplace = 0;
+            u32 lifted = 0, inplace = 0, tail_lifted = 0, tail_inplace = 0;
             frames_left--;
             for (u32 i = 0; i < rep_ndraws; i++) {
                 const vk_draw *d = &rep_draws[i];
                 float bx0 = 1e9f, by0 = 1e9f, bx1 = -1e9f, by1 = -1e9f;
-                if (d->native != PS2_VK_NATIVE_2D || d->rt != 0u) continue;
+                /* Safe trailing GS draws (including AC4 font glyphs) can
+                 * also be lifted. Report them separately from owned groups.
+                 * Mesh records do not index rep_verts and stay excluded. */
+                if ((d->native && d->native != PS2_VK_NATIVE_2D)
+                    || d->rt != PS2_VK_2D_SCENE_RT) continue;
                 for (u32 k = 0; k < d->count; k++) {
                     const ps2_vk_vertex *vv = &rep_verts[d->first + k];
                     if (vv->x < bx0) bx0 = vv->x;
@@ -3417,11 +3738,21 @@ static void ov_scan(void) {
                 }
                 if (bx1 < (float)rx0 || bx0 > (float)rx1 || by1 < (float)ry0 || by0 > (float)ry1)
                     continue;
-                if (ov_eligible[i]) lifted++;
-                else inplace++;
+                if (d->native == PS2_VK_NATIVE_2D) {
+                    if (ov_eligible[i]) lifted++;
+                    else inplace++;
+                } else {
+                    if (ov_eligible[i]) tail_lifted++;
+                    else tail_inplace++;
+                }
+                if (detail) ps2_log("ov-region-draw: frame %llu draw %u native %u tex %u vertices %u bounds %.2f,%.2f,%.2f,%.2f lifted %u",
+                    (unsigned long long)stat_frames, i, d->native, d->tex, d->count,
+                    bx0, by0, bx1, by1, (unsigned)ov_eligible[i]);
             }
             ps2_log("ov-region: frame %llu lifted %u in place %u",
                     (unsigned long long)stat_frames, lifted, inplace);
+            ps2_log("ov-region-tail: frame %llu lifted %u in place %u",
+                    (unsigned long long)stat_frames, tail_lifted, tail_inplace);
         }
     }
 }
@@ -3464,6 +3795,59 @@ static void ov_promote(void) {
     ov_lists[ov_accum].overflow = 0;
 }
 
+/* Commit all attachments together. Reused descriptors continue referencing the
+ * old images until every new allocation succeeds, preserving pending HUD lists
+ * when a window-resolution change cannot allocate its destination mask. */
+static int ov_replace_target(u32 k, u32 w, u32 h, int mask) {
+    vk_target fresh = {0};
+    fresh.set = ov_comp.set;
+    fresh.sset = ov_comp.sset;
+    if (make_image(w * k, h * k, VK_FORMAT_R8G8B8A8_UNORM,
+                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                   | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                   VK_IMAGE_ASPECT_COLOR_BIT, &fresh.color, &fresh.cmem, &fresh.cview) != 0
+        || make_image(w * k, h * k, VK_FORMAT_D32_SFLOAT,
+                      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT,
+                      &fresh.depth, &fresh.dmem, &fresh.dview) != 0
+        || (mask && make_image(w * k, h * k, VK_FORMAT_R8G8B8A8_UNORM,
+                              VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                              VK_IMAGE_ASPECT_COLOR_BIT,
+                              &fresh.snap, &fresh.smem, &fresh.sview) != 0)) {
+        destroy_target_images(&fresh);
+        return 0;
+    }
+    if (!fresh.set) fresh.set = alloc_set(fresh.cview);
+    if (mask && !fresh.sset) fresh.sset = alloc_set(fresh.sview);
+    if (!fresh.set || (mask && !fresh.sset)) {
+        /* Retain newly allocated descriptor slots for a later attempt. */
+        if (!ov_comp.set) ov_comp.set = fresh.set;
+        if (!ov_comp.sset) ov_comp.sset = fresh.sset;
+        destroy_target_images(&fresh);
+        return 0;
+    }
+    rebind_set(fresh.set, fresh.cview);
+    if (mask) rebind_set(fresh.sset, fresh.sview);
+    destroy_target_images(&ov_comp);
+    ov_comp = fresh;
+    ov_comp.layout = ov_comp.dlayout = ov_comp.slayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    ov_comp.created = 1;
+    ov_k = k; ov_cw = w; ov_ch = h;
+    return 1;
+}
+
+/* Optional full-output coverage: preserve integer GS scaling while avoiding
+ * horizontal upscaling of a widescreen display crop. Hardware limits still apply. */
+static u32 window_cover_scale(u32 w,u32 h,u32 pw,u32 ph) {
+    if(pw<=1 || ph<=1)return 1;
+    u64 x=((u64)w+pw-1)/pw,y=((u64)h+ph-1)/ph;
+    u64 k=x>y?x:y;
+    return k>RT_SCALE_MAX?RT_SCALE_MAX:k<1?1:(u32)k;
+}
+static int full_output_resolution(void) {
+    static int enabled=-1;
+    return PS2_GAME_AC4 && vk_env_flag("PS2_AC4_FULL_OUTPUT_RES",&enabled);
+}
+
 static void ov_prepare(void) {
     static int env_k = -1;
     u32 k, big = rt_w > rt_h ? rt_w : rt_h, lim;
@@ -3475,46 +3859,155 @@ static void ov_prepare(void) {
     if (!ov_enabled() || !ov_seen || !present_h) return;
     k = env_k > 0 ? (u32)env_k
                   : (swap_extent.height + present_h - 1u) / present_h;
+    if (!env_k && full_output_resolution())
+        k=window_cover_scale(swap_extent.width,swap_extent.height,present_w,present_h);
     if (k < rt_scale) k = rt_scale;
     lim = max_image_dim / (big ? big : 1u);
     if (k > lim) k = lim;
     if (k > RT_SCALE_MAX) k = RT_SCALE_MAX;
     if (k < 1u) k = 1u;
     if (!ov_comp.created || ov_k != k || ov_cw != rt_w || ov_ch != rt_h) {
-        vkDeviceWaitIdle(dev);
-        destroy_target_images(&ov_comp);
-        if (make_image(rt_w * k, rt_h * k, VK_FORMAT_R8G8B8A8_UNORM,
-                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
-                       | VK_IMAGE_USAGE_SAMPLED_BIT
-                       | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-                       | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                       VK_IMAGE_ASPECT_COLOR_BIT,
-                       &ov_comp.color, &ov_comp.cmem, &ov_comp.cview) != 0
-            || make_image(rt_w * k, rt_h * k, VK_FORMAT_D32_SFLOAT,
-                          VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-                          VK_IMAGE_ASPECT_DEPTH_BIT,
-                          &ov_comp.depth, &ov_comp.dmem, &ov_comp.dview) != 0) {
-            destroy_target_images(&ov_comp);
+        static int mask = -1;
+        int want_mask = PS2_GAME_AC4 && vk_env_flag("PS2_AC4_SCREEN_MASK", &mask);
+        if (vkDeviceWaitIdle(dev) != VK_SUCCESS || !ov_replace_target(k, rt_w, rt_h, want_mask)) {
+            /* Window resizing can retain the previous resolution, including
+             * pending cross-field masks. A changed GS layout cannot use it. */
+            if (ov_comp.created && ov_cw == rt_w && ov_ch == rt_h) {
+                ov_show = ov_comp.set != VK_NULL_HANDLE;
+                return;
+            }
             ov_on = 0;
-            ps2_log("vk: the 2D overlay target (%ux%u) could not be made; "
-                    "native 2D is drawn in place", rt_w * k, rt_h * k);
+            ps2_log("vk: overlay allocation failed; native 2D is drawn in place");
             return;
         }
-        if (ov_comp.set) rebind_set(ov_comp.set, ov_comp.cview);
-        else ov_comp.set = alloc_set(ov_comp.cview);
-        ov_comp.layout = VK_IMAGE_LAYOUT_UNDEFINED;
-        ov_comp.dlayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        ov_comp.created = 1;
-        ov_k = k; ov_cw = rt_w; ov_ch = rt_h;
         ps2_log("vk: 2D overlay composed at %ux (%ux%u)", k, rt_w * k, rt_h * k);
     }
     ov_show = ov_comp.set != VK_NULL_HANDLE;
 }
 
-static void ov_compose(VkCommandBuffer cmd, vk_frame *fr) {
+static int ov_display_prepare(void) {
+    if (vk_env_flag("PS2_AC4_SCREEN_DISPLAY_FALLBACK", &ov_display_fallback)) return 0;
+    if (ov_display.created && ov_display_k == ov_k
+        && ov_display_w == rt_w && ov_display_h == rt_h) return 1;
+    vkDeviceWaitIdle(dev);
+    destroy_target_images(&ov_display);
+    if (make_image(rt_w * ov_k, rt_h * ov_k, VK_FORMAT_R8G8B8A8_UNORM,
+                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                   | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT,
+                   &ov_display.color, &ov_display.cmem, &ov_display.cview) != 0
+        || make_image(rt_w * ov_k, rt_h * ov_k, VK_FORMAT_D32_SFLOAT,
+                      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT,
+                      &ov_display.depth, &ov_display.dmem, &ov_display.dview) != 0) {
+        destroy_target_images(&ov_display);
+        return 0;
+    }
+    if (ov_display.set) rebind_set(ov_display.set, ov_display.cview);
+    else ov_display.set = alloc_set(ov_display.cview);
+    ov_display.layout = ov_display.dlayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    ov_display.created = 1;
+    ov_display_k = ov_k; ov_display_w = rt_w; ov_display_h = rt_h;
+    return ov_display.set != VK_NULL_HANDLE;
+}
+
+/* Replay the original display transfer at overlay resolution. The normal
+ * target is also rendered, so later GS users retain a valid low-res image. */
+static void ov_display_copy(VkCommandBuffer cmd, vk_frame *fr,
+                            const vk_draw *d, const gs_push *original) {
+    VkRenderingAttachmentInfo col = {0}, dep = {0};
+    VkRenderingInfo ri = {0};
+    VkViewport vp = {0};
+    VkRect2D sc;
+    VkDeviceSize zero = 0;
+    VkDescriptorSet sets[2] = {ov_comp.set, white_set};
+    VkPipeline pipe = get_pipeline(d->topology, d->blend, d->depth);
+    gs_push pc = *original;
+    float bc[4] = {(float)d->fix / 128.0f, (float)d->fix / 128.0f,
+                   (float)d->fix / 128.0f, (float)d->fix / 128.0f};
+    if (!pipe || !ov_display_ready || !ov_display.created) return;
+    if (rendering_open) { vkCmdEndRendering(cmd); rendering_open = 0; }
+    barrier(cmd, ov_display.color, VK_IMAGE_ASPECT_COLOR_BIT, ov_display.layout,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    barrier(cmd, ov_display.depth, VK_IMAGE_ASPECT_DEPTH_BIT, ov_display.dlayout,
+            VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
+            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+    col.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    col.imageView = ov_display.cview;
+    col.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    col.loadOp = ov_display.layout == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+    col.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    dep = col; dep.imageView = ov_display.dview;
+    dep.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    dep.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; dep.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    ri.renderArea.extent = (VkExtent2D){rt_w * ov_k, rt_h * ov_k};
+    ri.layerCount = 1; ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &col; ri.pDepthAttachment = &dep;
+    vkCmdBeginRendering(cmd, &ri);
+    vp.width = (float)(rt_w * ov_k); vp.height = (float)(rt_h * ov_k); vp.maxDepth = 1.0f;
+    vkCmdSetViewport(cmd, 0, 1, &vp);
+    s32 x0 = d->scissor[0] < 0 ? 0 : d->scissor[0];
+    s32 y0 = d->scissor[2] < 0 ? 0 : d->scissor[2];
+    s32 x1 = d->scissor[1] + 1, y1 = d->scissor[3] + 1;
+    if (x1 > (s32)rt_w) x1 = (s32)rt_w;
+    if (y1 > (s32)rt_h) y1 = (s32)rt_h;
+    sc.offset = (VkOffset2D){x0 * (s32)ov_k, y0 * (s32)ov_k};
+    sc.extent = (VkExtent2D){x1 > x0 ? (u32)(x1-x0)*ov_k : 0, y1 > y0 ? (u32)(y1-y0)*ov_k : 0};
+    vkCmdSetScissor(cmd, 0, 1, &sc);
+    pc.scale = pc.tex_scale = (float)ov_k;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    vkCmdSetBlendConstants(cmd, bc);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, gs_layout, 0, 2, sets, 0, NULL);
+    vkCmdBindVertexBuffers(cmd, 0, 1, &fr->vbuf, &zero);
+    vkCmdPushConstants(cmd, gs_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
+    vkCmdDraw(cmd, d->count, 1, d->first, 0);
+    vkCmdEndRendering(cmd);
+    ov_display.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ov_display.dlayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    ov_display_show = 1;
+    stat_ov_display_copies++;
+}
+
+/* Called between overlay draws with rendering closed. Unlike scene snapshots,
+ * this uses the overlay dimensions and never resumes the scene render target. */
+static void ov_mask_snapshot(VkCommandBuffer cmd) {
+    static unsigned reports;
+    VkImageCopy copy = {0};
+    stat_ov_masks++;
+    stat_ov_mask_bytes += (u64)rt_w * ov_k * rt_h * ov_k * 4u;
+    if (reports++ < 8u) ps2_log("vk: overlay DATE snapshot at %ux%u", rt_w * ov_k, rt_h * ov_k);
+    barrier(cmd, ov_comp.color, VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    barrier(cmd, ov_comp.snap, VK_IMAGE_ASPECT_COLOR_BIT,
+            ov_comp.slayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT,
+            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copy.srcSubresource.layerCount = 1;
+    copy.dstSubresource = copy.srcSubresource;
+    copy.extent.width = rt_w * ov_k;
+    copy.extent.height = rt_h * ov_k;
+    copy.extent.depth = 1;
+    vkCmdCopyImage(cmd, ov_comp.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   ov_comp.snap, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    barrier(cmd, ov_comp.snap, VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
+    barrier(cmd, ov_comp.color, VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    ov_comp.slayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+}
+
+static void ov_compose(VkCommandBuffer cmd, vk_frame *fr, u32 source_rt) {
     ov_list *r = &ov_lists[1 - ov_accum];
-    vk_target *src = &rts[present_rt < RT_SLOTS && rts[present_rt].created
-                          ? present_rt : 0];
+    vk_target *src = &rts[source_rt < RT_SLOTS && rts[source_rt].created
+                          ? source_rt : 0];
     u32 k = ov_k, iw = rt_w * k, ih = rt_h * k;
     float line_w = (float)k, point_sz = (float)k;
     VkImageBlit b;
@@ -3657,6 +4150,14 @@ static void ov_compose(VkCommandBuffer cmd, vk_frame *fr) {
                 sets[0] = d->tex_depth ? t->dset : t->set;
         }
         sets[1] = white_set;
+        if (d->date) {
+            vkCmdEndRendering(cmd);
+            ov_mask_snapshot(cmd);
+            /* Overlay eligibility excludes depth-dependent draws. Clearing its
+             * private depth again is intentional; the color mask is loaded. */
+            vkCmdBeginRendering(cmd, &ri);
+            sets[1] = ov_comp.sset;
+        }
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, gs_layout,
                                 0, 2, sets, 0, NULL);
         bc[0] = bc[1] = bc[2] = bc[3] = (float)d->fix / 128.0f;
@@ -3787,6 +4288,8 @@ static void render_list(VkCommandBuffer cmd, vk_frame *fr) {
 
     for (i = 0; i < rep_ndraws; i++) {
         vk_draw *d = &rep_draws[i];
+        int precomposed = 0;
+        if (d->rt == present_rt) ov_display_show = 0;
         VkPipeline pipe;
         VkDescriptorSet set = white_set;
         VkRect2D sc;
@@ -3808,10 +4311,22 @@ static void render_list(VkCommandBuffer cmd, vk_frame *fr) {
                     ps2_log("ov-list: frame %llu composite at draw %u of %u into rt%u (present_rt %u), promoting %u draws",
                             (unsigned long long)stat_frames, i, rep_ndraws, d->rt, present_rt, ov_lists[ov_accum].nd);
                 ov_promote();
+                if (PS2_GAME_AC4 && vk_env_flag("PS2_AC4_SCREEN_PRECOMPOSE", &ov_precompose)
+                    && ov_show && !clip_open) {
+                    ov_compose(cmd, fr, PS2_VK_2D_SCENE_RT);
+                    precomposed = ov_show;
+                    if (precomposed) stat_ov_precomposed++;
+                    cur_rt = cur_zrt = -1;
+                    bound_pipe = VK_NULL_HANDLE;
+                    bound_sets[0] = bound_sets[1] = VK_NULL_HANDLE;
+                    mset_ok = ib_ok = have_sc = have_pc = cur_fb_w = vb = 0;
+                    bound_fix = ~0u;
+                    ov_show = 0;
+                }
             }
-            else if (d->tex_rt == 1u && d->rt != 0u
+            else if (d->tex_rt == PS2_VK_2D_SCENE_RT + 1u && d->rt != PS2_VK_2D_SCENE_RT
                      && vk_env_flag("PS2_RN_OV_LIST", &ov_list_log))
-                ps2_log("ov-list: frame %llu draw %u reads slot 0 into rt%u (present_rt %u) -- not a composite",
+                ps2_log("ov-list: frame %llu draw %u reads scene target into rt%u (present_rt %u) -- not a composite",
                         (unsigned long long)stat_frames, i, d->rt, present_rt);
         }
 
@@ -3898,6 +4413,7 @@ static void render_list(VkCommandBuffer cmd, vk_frame *fr) {
                 if (d->scissor[1] + 1 > inv->sdx1) inv->sdx1 = d->scissor[1] + 1;
                 if (d->scissor[3] + 1 > inv->sdy1) inv->sdy1 = d->scissor[3] + 1;
             }
+            if (precomposed) rset = ov_comp.set;
             if (rset) set = rset;
             else if (d->tex != 0xFFFF && d->tex < ntextures
                      && textures[d->tex].set)
@@ -3981,7 +4497,7 @@ static void render_list(VkCommandBuffer cmd, vk_frame *fr) {
         } else {
             pc.img_size[0] = pc.img_size[1] = 1.0f;
         }
-        pc.tex_scale = d->tex_rt ? (float)rt_scale : 1.0f;
+        pc.tex_scale = precomposed ? (float)ov_k : d->tex_rt ? (float)rt_scale : 1.0f;
         pc.pad = (float)d->tex_mip;
         pc.flags[0] = d->frag_flags;
         pc.flags[1] = (d->tex != 0xFFFF || d->tex_rt) ? 1u : 0u;
@@ -4016,6 +4532,13 @@ static void render_list(VkCommandBuffer cmd, vk_frame *fr) {
                 }
                 vr = rep_verts[d->first].r; vg = rep_verts[d->first].g;
                 vb = rep_verts[d->first].b; va = rep_verts[d->first].a;
+                if (PS2_GAME_AC4 && ov_is_composite(d)) {
+                    for (k = 0; k < d->count && k < 6u; k++) {
+                        const ps2_vk_vertex *v = &rep_verts[d->first + k];
+                        ps2_log("ac4 composite vertex %u: xy %.4f %.4f uv %.4f %.4f q %.4f round %08X",
+                                k, v->x, v->y, v->s, v->t, v->q, v->round_uv);
+                    }
+                }
             }
             ps2_log("  draw %3u: seq=%u em=%u rt%u tex=%d n=%u x[%.1f..%.1f] "
                     "y[%.1f..%.1f] rgba(%.0f,%.0f,%.0f,%.0f) blend=%03X fix=%u "
@@ -4054,12 +4577,32 @@ static void render_list(VkCommandBuffer cmd, vk_frame *fr) {
             vkCmdDraw(cmd, d->count, 1, d->first, 0);
         }
         stat_draws++;
+        if (precomposed) {
+            ov_display_copy(cmd, fr, d, &pc);
+            cur_rt = cur_zrt = -1;
+            bound_pipe = VK_NULL_HANDLE;
+            bound_sets[0] = bound_sets[1] = VK_NULL_HANDLE;
+            mset_ok = ib_ok = have_sc = have_pc = cur_fb_w = vb = 0;
+            bound_fix = ~0u;
+        }
     }
 
     if (clip_open) colclip_resolve(cmd, &rts[cur_rt], &rts[cur_zrt]);
     if (rendering_open) { vkCmdEndRendering(cmd); rendering_open = 0; }
-    if (ov_on > 0 && present_rt == 0u) ov_promote();
+    if (ov_on > 0 && present_rt == PS2_VK_2D_SCENE_RT) ov_promote();
     stat_verts += rep_nverts;
+}
+
+static u32 present_log_slot(const vk_target *shown) {
+    return shown == &ov_display ? RT_SLOTS + 1u : shown == &ov_comp ? RT_SLOTS : (u32)(shown - rts);
+}
+
+static void acquire_image_barrier(VkCommandBuffer cmd,u32 image_index) {
+    barrier(cmd,swap_images[image_index],VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,0,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
 }
 
 static void present_frame(VkCommandBuffer cmd, u32 image_index) {
@@ -4113,9 +4656,12 @@ static void present_frame(VkCommandBuffer cmd, u32 image_index) {
         float k = ceilf(sh * scale_y / (float)present_h - 0.01f);
         auto_scale_target = k < 1.0f ? 1u
                           : k > (float)RT_SCALE_MAX ? RT_SCALE_MAX : (u32)k;
+        if(full_output_resolution())
+            auto_scale_target=window_cover_scale((u32)ceilf(sw*scale_x-0.01f),
+                (u32)ceilf(sh*scale_y-0.01f),present_w,present_h);
     }
 
-    vk_target *shown = ov_show ? &ov_comp
+    vk_target *shown = ov_display_show ? &ov_display : ov_show ? &ov_comp
                      : &rts[present_rt < RT_SLOTS && rts[present_rt].created
                             ? present_rt : 0];
     if (shown->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
@@ -4127,11 +4673,9 @@ static void present_frame(VkCommandBuffer cmd, u32 image_index) {
                 VK_ACCESS_2_SHADER_READ_BIT);
         shown->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
-    barrier(cmd, swap_images[image_index], VK_IMAGE_ASPECT_COLOR_BIT,
-            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
-            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    /* Match the acquire semaphore's wait stage. TOP_OF_PIPE here would
+     * allow the layout transition before presentation releases the image. */
+    acquire_image_barrier(cmd,image_index);
 
     memset(&col, 0, sizeof(col));
     col.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -4189,8 +4733,8 @@ static void present_frame(VkCommandBuffer cmd, u32 image_index) {
     {
         /* Alternating front/back targets are normal. Remember each target's
          * geometry so that field alternation does not flush a log line at 60 Hz. */
-        static u64 last_key[RT_SLOTS];
-        u32 shown_slot = (u32)(shown - rts);
+        static u64 last_key[RT_SLOTS + 2u];
+        u32 shown_slot = present_log_slot(shown);
         u64 key = ((u64)present_w << 40) | ((u64)present_h << 24)
                 | swap_extent.width | ((u64)rt_scale << 56);
         if (key != last_key[shown_slot] || PS2_ENV("PS2_TRACE_PRESENT")) {
@@ -4200,7 +4744,7 @@ static void present_frame(VkCommandBuffer cmd, u32 image_index) {
                     "scale %.3f,%.3f letterboxed=%d shaded %d,%d %ux%u | "
                     "map %.4f,%.4f,%.4f,%.4f  bound %.3f,%.3f,%.3f,%.3f",
                     (void *)present_pipe, (void *)shown->set,
-                    (u32)(shown - rts), shown->created, (int)shown->layout,
+                    shown_slot, shown->created, (int)shown->layout,
                     rt_w, rt_h, rt_scale, present_x, present_y, present_w, present_h,
                     swap_extent.width, swap_extent.height,
                     scale_x, scale_y, letterboxed,
@@ -4254,9 +4798,11 @@ static void present_frame(VkCommandBuffer cmd, u32 image_index) {
 
     read_w = rt_w * rt_scale;
     read_h = rt_h * rt_scale;
-    read_slot = shown == &ov_comp ? (present_rt < RT_SLOTS ? present_rt : 0u)
+    read_slot = (shown == &ov_comp || shown == &ov_display) ? (present_rt < RT_SLOTS ? present_rt : 0u)
                                   : (u32)(shown - rts);
     ov_presented = shown == &ov_comp;
+    ov_display_presented = shown == &ov_display;
+    if (ov_display_presented) stat_ov_display_presented++;
     if (depth_buf && rts[0].created
         && rts[0].dlayout != VK_IMAGE_LAYOUT_UNDEFINED
         && (VkDeviceSize)read_w * read_h * 4u <= depth_capacity) {
@@ -4314,10 +4860,24 @@ static void gpu_speed_collect(vk_frame *fr) {
 
 static int field_skip_present;
 
+/* SUBOPTIMAL is a successful acquisition: its semaphore is already signaled
+ * and must be consumed by submission before recreating the swapchain. */
+static VkResult acquire_swap_image(vk_frame *fr,u32 *image_index) {
+    VkResult r=vkAcquireNextImageKHR(dev,swapchain,VK_WAIT_NS,fr->acquired,VK_NULL_HANDLE,image_index);
+    if(r==VK_ERROR_OUT_OF_DATE_KHR) {
+        vkDeviceWaitIdle(dev);
+        if(create_swapchain()!=0)return VK_ERROR_OUT_OF_DATE_KHR;
+        r=vkAcquireNextImageKHR(dev,swapchain,VK_WAIT_NS,fr->acquired,VK_NULL_HANDLE,image_index);
+    }
+    if(r==VK_SUBOPTIMAL_KHR)swap_dirty=1;
+    return r;
+}
+
 static void draw_and_present(void) {
     vk_frame *fr = &frames[frame_index];
     u32 image_index = 0;
-    int show = !field_skip_present;
+    int show = !field_skip_present && !test_skip_present;
+    test_skip_present = 0;
     VkResult r;
     VkCommandBufferBeginInfo bi;
     VkSubmitInfo si;
@@ -4337,14 +4897,7 @@ static void draw_and_present(void) {
             vkDeviceWaitIdle(dev);
             if (create_swapchain() != 0) goto finished;
         }
-        r = vkAcquireNextImageKHR(dev, swapchain, VK_WAIT_NS, fr->acquired,
-                                  VK_NULL_HANDLE, &image_index);
-        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) {
-            vkDeviceWaitIdle(dev);
-            if (create_swapchain() != 0) goto finished;
-            r = vkAcquireNextImageKHR(dev, swapchain, VK_WAIT_NS, fr->acquired,
-                                      VK_NULL_HANDLE, &image_index);
-        }
+        r = acquire_swap_image(fr, &image_index);
         if (timing) { u64 now=vk_mono_ns(); times[VS_ACQUIRE]=now-mark; mark=now; }
         if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) goto finished;
     }
@@ -4355,6 +4908,9 @@ static void draw_and_present(void) {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkResetCommandBuffer(fr->cmd, 0);
     if (show && !present_blank) ov_prepare(); else ov_show = 0;
+    ov_display_show = ov_display_ready = 0;
+    if (ov_show && PS2_GAME_AC4 && vk_env_flag("PS2_AC4_SCREEN_PRECOMPOSE", &ov_precompose))
+        ov_display_ready = ov_display_prepare();
     vkBeginCommandBuffer(fr->cmd, &bi);
     if (fr->timing_queries) {
         vkCmdResetQueryPool(fr->cmd, fr->timing_queries, 0, 3);
@@ -4363,7 +4919,7 @@ static void draw_and_present(void) {
     render_list(fr->cmd, fr);
     if (fr->timing_queries)
         vkCmdWriteTimestamp(fr->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, fr->timing_queries, 1);
-    if (show && ov_show) ov_compose(fr->cmd, fr);
+    if (show && ov_show) ov_compose(fr->cmd, fr, present_rt);
     if (show) present_frame(fr->cmd, image_index);
     if (fr->timing_queries)
         vkCmdWriteTimestamp(fr->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, fr->timing_queries, 2);
@@ -4378,7 +4934,8 @@ static void draw_and_present(void) {
     si.commandBufferCount = 1;
     si.pCommandBuffers = &fr->cmd;
     si.signalSemaphoreCount = show ? 1u : 0u;
-    si.pSignalSemaphores = &fr->rendered;
+    VkSemaphore present_done = show ? swap_rendered[image_index] : VK_NULL_HANDLE;
+    si.pSignalSemaphores = &present_done;
     VkResult submit_result = vkQueueSubmit(queue, 1, &si, fr->fence);
     fr->timing_pending = fr->timing_queries && submit_result == VK_SUCCESS;
     if (timing) { u64 now=vk_mono_ns(); times[VS_SUBMIT]=now-mark; mark=now; }
@@ -4389,7 +4946,7 @@ static void draw_and_present(void) {
     memset(&pi, 0, sizeof(pi));
     pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     pi.waitSemaphoreCount = 1;
-    pi.pWaitSemaphores = &fr->rendered;
+    pi.pWaitSemaphores = &present_done;
     pi.swapchainCount = 1;
     pi.pSwapchains = &swapchain;
     pi.pImageIndices = &image_index;
@@ -4420,7 +4977,6 @@ enum { B_SELECT = 0, B_L3, B_R3, B_START, B_UP, B_RIGHT, B_DOWN, B_LEFT,
 
 static SDL_Gamepad *gamepad;
 
-static int window_hidden;
 void ps2_video_hidden(int on) { window_hidden = on; }
 
 static int pad_deadzone_env(void) {
@@ -4537,12 +5093,31 @@ static void poll_input(void) {
     ps2_pad_publish(0, &st);
 }
 
+static void publish_present_state(u32 x,u32 y,u32 w,u32 h,u32 rt,int override_rt) {
+    if(w)pub_present.w=w;
+    if(h)pub_present.h=h;
+    pub_present.x=x;pub_present.y=y;
+    pub_present.blank=rt==PS2_VK_PRESENT_BLANK;
+    pub_present.rt=rt<RT_SLOTS?rt:0;
+    if(override_rt>=0){pub_present.rt=(u32)override_rt%RT_SLOTS;pub_present.blank=0;}
+}
+/* list_lock is held by both the renderer loop and modal window redraw path. */
+static void latch_pending_frame(void) {
+    rep_verts=pub_verts;rep_draws=pub_draws;
+    rep_nverts=pub_nverts;rep_ndraws=pub_ndraws;rep_mesh=pub_mesh;
+    present_x=pub_present.x;present_y=pub_present.y;
+    present_w=pub_present.w;present_h=pub_present.h;
+    present_rt=pub_present.rt;present_blank=pub_present.blank;
+    if(frame_trace_on){rep_source=pub_source;rep_ready_ns=pub_ready_ns;rep_publish_ns=pub_publish_ns;rep_take_ns=vk_mono_ns();}
+    frame_requested=0;frame_rendering=1;
+}
+
 static int take_pending_frame(void) {
     int got;
     pthread_mutex_lock(&list_lock);
     got = frame_requested;
     if (got) {
-        frame_requested = 0;
+        latch_pending_frame();
         pthread_cond_broadcast(&list_cv);
     }
     pthread_mutex_unlock(&list_lock);
@@ -4636,6 +5211,18 @@ static int field_present_due(void) {
     return 1;
 }
 
+/* AC4 switches between 640-wide menus and a 512-wide flight crop. Auto
+ * must cover both without rebuilding every live target at each transition.
+ * Recompute from the current window, so window downsizing still releases VRAM.
+ * Explicit internal-resolution selections bypass this policy. */
+static u32 ac4_stable_auto_scale(u32 requested) {
+    const char *e=getenv("PS2_AC4_STABLE_AUTO");
+    if(!PS2_GAME_AC4 || !full_output_resolution() || (e && atoi(e)==0))
+        return requested;
+    u32 floor=window_cover_scale(swap_extent.width,swap_extent.height,512u,448u);
+    return requested>floor ? requested : floor;
+}
+
 static u32 choose_scale(u32 need_w, u32 need_h) {
     static int env = -2;
     static u32 auto_last, asked_last;
@@ -4660,8 +5247,9 @@ static u32 choose_scale(u32 need_w, u32 need_h) {
         if (cycle > 0) want = steps[(stat_frames / (u64)cycle) % 4u];
     }
     if (want <= 0) {
-        if (auto_scale_target != auto_last) {
-            auto_last = auto_scale_target;
+        u32 target=ac4_stable_auto_scale(auto_scale_target);
+        if (target != auto_last) {
+            auto_last = target;
             auto_since = SDL_GetTicks();
         }
         s = !rts[0].created || SDL_GetTicks() - auto_since >= 250
@@ -4691,6 +5279,7 @@ static void replay_frame(void) {
     pthread_mutex_unlock(&gpu_lock);
     PS2_PHASE_END(PS2_PH_PRESENT);
     pthread_mutex_lock(&list_lock);
+    frame_rendering = 0;
     frame_done = 1;
     pthread_cond_broadcast(&list_cv);
     pthread_mutex_unlock(&list_lock);
@@ -4716,7 +5305,7 @@ static void replay_frame_inner(void) {
 
 static bool SDLCALL modal_redraw_watch(void *ud, SDL_Event *e) {
     (void)ud;
-    if (!vk_ready || in_modal_redraw || window_minimised) return true;
+    if (!vk_ready || in_modal_redraw || window_minimised || window_hidden) return true;
     if (SDL_GetCurrentThreadID() != render_tid) return true;
     switch (e->type) {
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
@@ -4975,13 +5564,7 @@ static void *renderer_main(void *arg) {
             pthread_cond_timedwait(&list_cv, &list_lock, &ts);
             if (!frame_requested) { pthread_mutex_unlock(&list_lock); continue; }
         }
-        rep_verts  = pub_verts;
-        rep_draws  = pub_draws;
-        rep_nverts = pub_nverts;
-        rep_ndraws = pub_ndraws;
-        rep_mesh   = pub_mesh;
-        if(frame_trace_on) { rep_source=pub_source; rep_ready_ns=pub_ready_ns; rep_publish_ns=pub_publish_ns; rep_take_ns=vk_mono_ns(); }
-        frame_requested = 0;
+        latch_pending_frame();
         pthread_cond_broadcast(&list_cv);
         pthread_mutex_unlock(&list_lock);
         field_skip_present = !field_present_due();
@@ -5011,6 +5594,7 @@ int ps2_video_init(const char *title, int width, int height) {
     snprintf(window_title, sizeof(window_title), "%s", title ? title : "ps2recomp");
     present_w = (u32)(width > 0 ? width : 640);
     present_h = (u32)(height > 0 ? height : 448);
+    pub_present=(vk_present_state){present_x,present_y,present_w,present_h,present_rt,present_blank};
 
     {   int s;
         for (s = 0; s < LIST_SLOTS; s++) {
@@ -5111,7 +5695,7 @@ int ps2_vk_mesh_material_ok(const ps2_vk_state *st) {
     }
     if (!sw || !mesh_fs) return 0;
     if (!st) return 1;
-    return !st->tex_mip && !st->clut_rt && !st->alpha_lookup && !st->date && !st->colclip && !st->shuffle_rg && !st->tex_self
+    return ps2_vk_mesh_mip_supported(st->tex_mip, PS2_GAME_AC4) && !st->clut_rt && !st->alpha_lookup && !st->date && !st->colclip && !st->shuffle_rg && !st->tex_self
         && !st->tex_depth && !st->zcopy && !st->fst && st->wms < 3u && st->wmt < 3u;
 }
 
@@ -5156,12 +5740,14 @@ void ps2_vk_draw_mesh_topo(const ps2_vk_state *st, const ps2_vk_mesh_block *b,
     mesh_arena *a = rec_mesh;
     if (!ps2_vk_mesh_available() || !n_indices) return;
     if (ps2_vk_before_record) ps2_vk_before_record();
-    if (a->nblocks >= MESH_MAX_BLOCKS) { stat_mesh_overflow++; return; }
-    a->blocks[a->nblocks] = *b;
+    int reused;
+    u32 block=ps2_vk_mesh_block_store(a->blocks,&a->nblocks,MESH_MAX_BLOCKS,b,PS2_GAME_AC4,&reused);
+    if (block == ~(u32)0) { stat_mesh_overflow++; return; }
+    stat_mesh_blocks_reused+=(u64)reused;
     rec_mesh_pending.vbase = vbase;
     rec_mesh_pending.ifirst = ifirst;
     rec_mesh_pending.icount = n_indices;
-    rec_mesh_pending.block = a->nblocks++;
+    rec_mesh_pending.block = block;
     rec_mesh_pending.cull = (cull & PS2_VK_MESH_CULL) ? 1u : 0u;
     {   int sw = ps2_vk_mesh_material_ok(NULL);
         if (cull & PS2_VK_MESH_GSFRAG) {
@@ -5376,7 +5962,7 @@ static void rec_one(int topology, const ps2_vk_state *st,
     d->tex_self = (u16)st->tex_self;
     d->tex_depth = (u16)st->tex_depth;
     d->date = (u16)st->date;
-    d->wrap = st->wms | (st->wmt << 2) | (st->native_region ? 0x100u : 0u);
+    d->wrap = st->wms | (st->wmt << 2) | ((st->native_region & 1) ? 0x100u : 0u) | ((st->native_region & 2) ? 0x200u : 0u) | ((st->native_region & 4) ? 0x400u : 0u) | ((st->native_region & 8) ? 0x800u : 0u);
     d->minu = (u16)st->minu;
     d->maxu = (u16)st->maxu;
     d->minv = (u16)st->minv;
@@ -5447,14 +6033,23 @@ void ps2_vk_native_draw(const ps2_vk_native *nd, const ps2_vk_vertex *v, int n) 
     rec_nverts += (u32)n;
 }
 
+/* Native mip images cannot reuse an uploaded single-level GS image. Reserve
+ * their owned mip bytes in the same budget decision as the base allocation. */
+static u32 texture_store(u64 key,u32 hash,const u8 *rgba,u32 w,u32 h,
+                         int immutable,size_t extra);
+
 u32 ps2_vk_texture_native(u32 src, u32 x, u32 y, u32 w, u32 h) {
+    return ps2_vk_texture_native_wrap(src, x, y, w, h, 0);
+}
+
+u32 ps2_vk_texture_native_wrap(u32 src, u32 x, u32 y, u32 w, u32 h, u32 clamp) {
     static u8 *buf;
     static size_t cap;
     vk_texture *s;
     const u8 *px;
     u64 key;
     u32 hash, idx, levels = 1;
-    if (!vk_ready || src >= ntextures) return 0xFFFFFFFFu;
+    if (!vk_ready || src >= ntextures || clamp > 3u) return 0xFFFFFFFFu;
     s = &textures[src];
     px = __atomic_load_n(&s->rgba, __ATOMIC_ACQUIRE);
     if (!px || s->levels > 1u || x >= s->w || y >= s->h) return 0xFFFFFFFFu;
@@ -5463,9 +6058,11 @@ u32 ps2_vk_texture_native(u32 src, u32 x, u32 y, u32 w, u32 h) {
     if (!w || !h) return 0xFFFFFFFFu;
     key = (1ull << 63) | ((s->key * 0x9E3779B97F4A7C15ull) >> 1);
     key ^= ((u64)x << 42) ^ ((u64)y << 30) ^ ((u64)w << 16) ^ (u64)h;
+    key ^= (u64)clamp * 0x517CC1B727220A95ull;
     key |= 1ull << 63;
     hash = (s->hash * 16777619u) ^ (x * 73856093u) ^ (y * 19349663u)
          ^ (w * 83492791u) ^ h;
+    hash ^= clamp * 0x9E3779B9u;
     for (s32 i = tex_first(key); i >= 0; i = tex_next[i])
         if (textures[i].rgba && textures[i].key == key && textures[i].hash == hash
             && textures[i].w == w && textures[i].h == h) {
@@ -5481,11 +6078,51 @@ u32 ps2_vk_texture_native(u32 src, u32 x, u32 y, u32 w, u32 h) {
     for (u32 r = 0; r < h; r++)
         memcpy(buf + (size_t)r * w * 4u, px + ((size_t)(y + r) * s->w + x) * 4u,
                (size_t)w * 4u);
-    idx = ps2_vk_texture(key, hash, buf, w, h);
+    idx = texture_store(key, hash, buf, w, h, 1, 0);
     if (idx == 0xFFFFFFFFu) return idx;
     while ((w >> levels) || (h >> levels)) levels++;
-    if (!textures[idx].image) textures[idx].levels = levels;
+    if (!textures[idx].image) {
+        textures[idx].levels = levels;
+        textures[idx].native_clamp = clamp;
+    }
     return textures[idx].levels > 1u ? idx : 0xFFFFFFFFu;
+}
+
+u32 ps2_vk_texture_native_atlas(u32 src,u32 bw,u32 bh,u32 x,u32 y,u32 w,u32 h,u32 mxl,u32 clamp) {
+    if(!vk_ready || src>=ntextures || clamp>3u)return 0xFFFFFFFFu;
+    vk_texture *s=&textures[src];ps2_vk_mip_layout layout;
+    if(!s->rgba || s->levels>1u || !ps2_vk_mip_layout_make(&layout,s->w,s->h,bw,bh,x,y,w,h,mxl))return 0xFFFFFFFFu;
+    u64 key=(1ull<<63) | ((s->key*0x9E3779B97F4A7C15ull) ^ ((u64)s->hash<<24)
+        ^ ((u64)x<<42) ^ ((u64)y<<30) ^ ((u64)w<<16) ^ h ^ ((u64)mxl<<8)
+        ^ ((u64)clamp*0x517CC1B727220A95ull) ^ 0x41544c41534d4950ull);
+    u32 hash=s->hash ^ (x*73856093u) ^ (y*19349663u) ^ (w*83492791u) ^ h ^ (mxl<<16) ^ clamp;
+    for(s32 i=tex_first(key);i>=0;i=tex_next[i])
+        if(textures[i].key==key && textures[i].hash==hash && textures[i].w==w && textures[i].h==h
+           && textures[i].native_mips && textures[i].levels==layout.levels && textures[i].native_clamp==clamp) {
+            textures[i].rec_seq=tex_rec_seq;return (u32)i;
+        }
+    /* Reject an individually oversized chain before allocating its staging
+     * copy; current store pressure is handled by texture_store's safe GC. */
+    size_t total=layout.bytes+(size_t)w*h*8u;
+    if(total>VK_TEX_BYTES)return 0xFFFFFFFFu;
+    u8 *pixels=malloc(layout.bytes);if(!pixels)return 0xFFFFFFFFu;
+    ps2_vk_mip_extract(pixels,__atomic_load_n(&s->rgba,__ATOMIC_ACQUIRE),s->w,&layout);
+    u32 idx=texture_store(key,hash,pixels,w,h,1,layout.bytes);
+    if(idx==0xFFFFFFFFu || textures[idx].image || textures[idx].native_mips) {free(pixels);return 0xFFFFFFFFu;}
+    textures[idx].levels=layout.levels;textures[idx].native_clamp=clamp;
+    textures[idx].native_mip_bytes=layout.bytes;textures[idx].native_mips=pixels;
+    tex_bytes+=layout.bytes;return idx;
+}
+
+u32 ps2_vk_texture_find(u64 key, u32 hash, u32 w, u32 h) {
+    if (!vk_ready || !w || !h || (size_t)h > VK_TEX_BYTES / 8u / w) return 0xFFFFFFFFu;
+    for (s32 i = tex_first(key); i >= 0; i = tex_next[i])
+        if (textures[i].rgba && textures[i].key == key && textures[i].hash == hash
+            && textures[i].w == w && textures[i].h == h) {
+            textures[i].rec_seq = tex_rec_seq;
+            return (u32)i;
+        }
+    return 0xFFFFFFFFu;
 }
 
 u32 ps2_vk_texture_native_find(u64 key, u32 hash, u32 w, u32 h) {
@@ -5506,7 +6143,7 @@ u32 ps2_vk_texture_native_rgba(u64 key, u32 hash, const u8 *rgba, u32 w, u32 h) 
     idx = ps2_vk_texture_native_find(key, hash, w, h);
     if (idx != 0xFFFFFFFFu) return idx;
     key |= 1ull << 63;
-    idx = ps2_vk_texture(key, hash, rgba, w, h);
+    idx = texture_store(key, hash, rgba, w, h, 1, 0);
     if (idx == 0xFFFFFFFFu) return idx;
     while ((w >> levels) || (h >> levels)) levels++;
     if (!textures[idx].image) textures[idx].levels = levels;
@@ -5550,12 +6187,15 @@ u32 ps2_vk_texture_exact(u64 key,u32 hash,const u8 *rgba,u32 w,u32 h) {
  * Collect a batch to avoid a device wait for every newly encountered shape.
  * This is a correctness fallback, not a guarantee of stall-free collection. */
 static void texture_collect(size_t needed) {
-    u32 oldest = 2u, victim = 0xFFFFFFFFu;
+    static tex_retire_candidate candidates[VK_MAX_TEXTURES];
+    u32 count = 0;
     for (u32 i = 0; i < ntextures; i++) {
         u32 age = tex_rec_seq - textures[i].rec_seq;
-        if (textures[i].rgba && age > oldest) { oldest = age; victim = i; }
+        if (textures[i].rgba && age > 2u)
+            candidates[count++] = (tex_retire_candidate){i, age};
     }
-    if (victim == 0xFFFFFFFFu || needed > VK_TEX_BYTES) return;
+    if (!count || needed > VK_TEX_BYTES) return;
+    qsort(candidates, count, sizeof candidates[0], tex_retire_order);
     u64 start = vk_mono_ns();
     pthread_mutex_lock(&gpu_lock);
     if (vkDeviceWaitIdle(dev) != VK_SUCCESS) {
@@ -5565,14 +6205,16 @@ static void texture_collect(size_t needed) {
     const size_t reserve = 64u << 20;
     size_t target = needed + reserve <= VK_TEX_BYTES
                   ? VK_TEX_BYTES - needed - reserve : 0;
-    do {
+    for (u32 c = 0; c < count; c++) {
+        u32 victim = candidates[c].slot;
         vk_texture *t = &textures[victim];
         VkDescriptorSet set = t->set;
         tex_index_remove(victim);
         if (t->view) vkDestroyImageView(dev, t->view, NULL);
         if (t->image) vkDestroyImage(dev, t->image, NULL);
         texmem_release(t);
-        tex_bytes -= (size_t)t->w * t->h * 8u;
+        tex_bytes -= (size_t)t->w * t->h * 8u + t->native_mip_bytes;
+        free(t->native_mips);
         free(t->rgba);
         free(t->rgba_alt);
         memset(t, 0, sizeof *t);
@@ -5580,22 +6222,20 @@ static void texture_collect(size_t needed) {
         /* Keep a valid fallback if creation of a replacement image fails. */
         if (set) rebind_set(set, white_view);
         stat_tex_retired++;
-        oldest = 2u; victim = 0xFFFFFFFFu;
         if (tex_bytes <= target) break;
-        for (u32 i = 0; i < ntextures; i++) {
-            u32 age = tex_rec_seq - textures[i].rec_seq;
-            if (textures[i].rgba && age > oldest) { oldest = age; victim = i; }
-        }
-    } while (victim != 0xFFFFFFFFu);
+    }
     pthread_mutex_unlock(&gpu_lock);
     stat_tex_collects++;
     stat_tex_collect_ns += vk_mono_ns() - start;
 }
 
-u32 ps2_vk_texture(u64 key, u32 hash, const u8 *rgba, u32 w, u32 h) {
+static u32 texture_store(u64 key,u32 hash,const u8 *rgba,u32 w,u32 h,
+                         int immutable,size_t extra) {
     size_t bytes = (size_t)w * h * 4u;
     u32 i, spare = 0xFFFFFFFFu;
     if (!vk_ready || !w || !h || (size_t)h > VK_TEX_BYTES / 8u / w) return 0xFFFFFFFFu;
+    if (extra > VK_TEX_BYTES - bytes * 2u) return 0xFFFFFFFFu;
+    size_t needed = bytes * 2u + extra;
     for (s32 c = tex_first(key); c >= 0; c = tex_next[c]) {
         i = (u32)c;
         if (textures[i].key != key || textures[i].w != w || textures[i].h != h)
@@ -5604,7 +6244,7 @@ u32 ps2_vk_texture(u64 key, u32 hash, const u8 *rgba, u32 w, u32 h) {
             textures[i].rec_seq = tex_rec_seq;
             return i;
         }
-        if (spare == 0xFFFFFFFFu && textures[i].rgba
+        if (!immutable && spare == 0xFFFFFFFFu && textures[i].rgba && textures[i].levels <= 1u
             && (u32)(tex_rec_seq - textures[i].rec_seq) > 2u)
             spare = i;
     }
@@ -5612,8 +6252,8 @@ u32 ps2_vk_texture(u64 key, u32 hash, const u8 *rgba, u32 w, u32 h) {
      * introduced new VRAM addresses. Reuse a cold, same-size allocation under
      * pressure. More than two recording epochs keeps rec/pub/rep references
      * alive; dimensions and mip layout stay unchanged for queued GPU work. */
-    if (spare == 0xFFFFFFFFu
-        && (ntextures >= VK_MAX_TEXTURES || tex_bytes + bytes * 2u > VK_TEX_BYTES)) {
+    if (!immutable && spare == 0xFFFFFFFFu
+        && (ntextures >= VK_MAX_TEXTURES || tex_bytes > VK_TEX_BYTES - needed)) {
         u32 oldest = 2u;
         for (u32 c = 0; c < ntextures; ++c) {
             u32 age = tex_rec_seq - textures[c].rec_seq;
@@ -5644,11 +6284,11 @@ u32 ps2_vk_texture(u64 key, u32 hash, const u8 *rgba, u32 w, u32 h) {
     }
     /* Vacant slots retain their descriptor allocation, but no cache identity. */
     for (i = 0; i < ntextures && textures[i].rgba; i++) {}
-    if (i >= VK_MAX_TEXTURES || tex_bytes + bytes * 2u > VK_TEX_BYTES) {
-        texture_collect(bytes * 2u);
+    if (i >= VK_MAX_TEXTURES || tex_bytes > VK_TEX_BYTES - needed) {
+        texture_collect(needed);
         for (i = 0; i < ntextures && textures[i].rgba; i++) {}
     }
-    if (i >= VK_MAX_TEXTURES || tex_bytes + bytes * 2u > VK_TEX_BYTES) {
+    if (i >= VK_MAX_TEXTURES || tex_bytes > VK_TEX_BYTES - needed) {
         static int said;
         if (!said) {
             said = 1;
@@ -5684,8 +6324,37 @@ u32 ps2_vk_texture(u64 key, u32 hash, const u8 *rgba, u32 w, u32 h) {
     return i;
 }
 
+u32 ps2_vk_texture(u64 key, u32 hash, const u8 *rgba, u32 w, u32 h) {
+    return texture_store(key, hash, rgba, w, h, 0, 0);
+}
+
 void ps2_vk_invalidate(u32 base, u32 size) {
     (void)base; (void)size;
+}
+
+/* list_lock held. AC4 render targets carry state across fields: a timeout
+ * must not discard pending draws. Timed waits keep exit/shutdown observable.
+ * PS2_DROP_FIELDS=1 retains the old bounded handoff for comparison only. */
+static int wait_pending_field(int preserve,int legacy_queue) {
+    if(!frame_requested || (!preserve && !legacy_queue))
+        return renderer_running>0 && !window_closed && !ps2_exit_pending();
+    u64 start=vk_mono_ns();
+    handoff_wait_count++;
+    do {
+        struct timespec until;
+        clock_gettime(CLOCK_REALTIME,&until);
+        until.tv_nsec+=preserve?100000000L:33366667L;
+        if(until.tv_nsec>=1000000000L){until.tv_sec++;until.tv_nsec-=1000000000L;}
+        while(frame_requested && renderer_running>0 && !window_closed && !ps2_exit_pending()) {
+            int rc=pthread_cond_timedwait(&list_cv,&list_lock,&until);
+            if(rc==ETIMEDOUT){handoff_timeout_count++;break;}
+            if(rc){ps2_log("vk: field handoff failed (%d); stopping without replacing pending draws",rc);ps2_request_exit();break;}
+        }
+    } while(preserve && frame_requested && renderer_running>0 && !window_closed && !ps2_exit_pending());
+    u64 elapsed=vk_mono_ns()-start;
+    handoff_wait_ns+=elapsed;
+    if(elapsed>handoff_wait_max)handoff_wait_max=elapsed;
+    return renderer_running>0 && !window_closed && !ps2_exit_pending();
 }
 
 int ps2_vk_present(u32 disp_x, u32 disp_y, u32 disp_w, u32 disp_h, u32 rt) {
@@ -5731,29 +6400,16 @@ int ps2_vk_present(u32 disp_x, u32 disp_y, u32 disp_w, u32 disp_h, u32 rt) {
         while (frame_requested && renderer_running > 0 && !window_closed)
             pthread_cond_wait(&list_cv, &list_lock);
     }
-    /* Keep the existing pending field during short renderer scheduling delays.
-     * Wait only for ownership transfer, not for GPU completion. A bounded wait
-     * preserves the old replacement fallback when presentation is stalled. */
-    static int handoff_on = -1;
-    if (handoff_on < 0) {
-        const char *e = getenv("PS2_PRESENT_QUEUE");
-        handoff_on = e && atoi(e) != 0;
+    static int handoff_on=-1,no_drop=-1;
+    if(handoff_on<0){const char *e=getenv("PS2_PRESENT_QUEUE");handoff_on=e&&atoi(e)!=0;}
+    if(no_drop<0){
+        const char *e=getenv("PS2_DROP_FIELDS");
+        no_drop=PS2_GAME_AC4 && !(e&&atoi(e)!=0);
+        if(no_drop)ps2_log("vk: ordered AC4 fields enabled; pending draws are preserved (PS2_DROP_FIELDS=1 restores replacement)");
     }
-    if (!ps2_vk_lockstep && handoff_on
-        && frame_requested && renderer_running > 0 && !window_closed) {
-        struct timespec until;
-        u64 wait_start = vk_mono_ns();
-        handoff_wait_count++;
-        clock_gettime(CLOCK_REALTIME, &until);
-        until.tv_nsec += 33366667L;
-        if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
-        while (frame_requested && renderer_running > 0 && !window_closed) {
-            int rc = pthread_cond_timedwait(&list_cv, &list_lock, &until);
-            if (rc != 0) { if (rc == ETIMEDOUT) handoff_timeout_count++; break; }
-        }
-        u64 elapsed = vk_mono_ns() - wait_start;
-        handoff_wait_ns += elapsed;
-        if (elapsed > handoff_wait_max) handoff_wait_max = elapsed;
+    if(!ps2_vk_lockstep && !wait_pending_field(no_drop,handoff_on)){
+        pthread_mutex_unlock(&list_lock);
+        return 0;
     }
     replace = frame_requested && renderer_running > 0;
     if (replace) {
@@ -5801,14 +6457,8 @@ int ps2_vk_present(u32 disp_x, u32 disp_y, u32 disp_w, u32 disp_h, u32 rt) {
     rec_ndraws = 0;
     rec_mesh   = &slot_mesh[rec_slot];
     rec_mesh->nrecs = rec_mesh->nidx = rec_mesh->nblocks = 0;
-    if (disp_w) present_w = disp_w;
-    if (disp_h) present_h = disp_h;
-    present_x = disp_x;
-    present_y = disp_y;
-    present_blank = rt == PS2_VK_PRESENT_BLANK;
-    present_rt = rt < RT_SLOTS ? rt : 0;
     if (env_show_rt == -1) env_show_rt = env_flag("PS2_SHOW_RT");
-    if (env_show_rt >= 0) { present_rt = (u32)env_show_rt % RT_SLOTS; present_blank = 0; }
+    publish_present_state(disp_x,disp_y,disp_w,disp_h,rt,env_show_rt);
     if (!replace) tex_rec_seq++;
     frame_requested = 1;
     frame_done = 0;
@@ -5840,6 +6490,14 @@ void ps2_vk_stats(u64 *f, u64 *d, u64 *v, u64 *t) {
 }
 
 void ps2_video_report(void) {
+    if (stat_ov_display_copies)
+        ps2_log("vk: AC4 native display: %llu copies, %llu presented, %ux at %ux%u",
+                (unsigned long long)stat_ov_display_copies,
+                (unsigned long long)stat_ov_display_presented, ov_display_k,
+                ov_display_w * ov_display_k, ov_display_h * ov_display_k);
+    if (stat_ov_precomposed)
+        ps2_log("vk: AC4 pre-display overlay composed on %llu transfers",
+                (unsigned long long)stat_ov_precomposed);
     ps2_log("vk: %llu image allocations supplied by startup prewarm",(unsigned long long)warm_image_hits);
     frame_trace_report();
     if (handoff_wait_count) ps2_log("vk-handoff: %llu waits, %llu timeouts, %.2f ms total, %.2f ms maximum; pending-field ownership only",
@@ -5883,6 +6541,10 @@ void ps2_video_report(void) {
                 (unsigned long long)stat_native_vis,
                 (unsigned long long)stat_native_vis_kept,
                 (unsigned long long)stat_native_vis_none);
+    if (stat_mesh_blocks_reused)
+        ps2_log("vk: %llu duplicate AC4 model constant blocks reused (%llu bytes of arena upload avoided)",
+                (unsigned long long)stat_mesh_blocks_reused,
+                (unsigned long long)(stat_mesh_blocks_reused*sizeof(ps2_vk_mesh_block)));
     if (stat_mesh_draws || stat_mesh_overflow)
         ps2_log("vk: %llu native mesh draws (mesh.vert), %llu recorded with the native "
                 "material (mesh.frag); %llu batches refused for arena space",
@@ -5891,14 +6553,17 @@ void ps2_video_report(void) {
     if (stat_ov_frames || stat_ov_inplace)
         ps2_log("vk: 2D overlay composed on %llu frames at %ux, %llu draws lifted "
                 "onto it, %llu native 2D draws kept in place because the frame "
-                "wrote or read slot 0 after them%s",
+                "wrote or read the scene target after them%s",
                 (unsigned long long)stat_ov_frames, ov_k,
                 (unsigned long long)stat_ov_draws,
                 (unsigned long long)stat_ov_inplace,
                 ov_lists[0].overflow || ov_lists[1].overflow
                     ? "; an overlay list overflowed" : "");
+    if (stat_ov_masks)
+        ps2_log("vk: overlay DATE total: %llu snapshots, %llu bytes copied",
+                (unsigned long long)stat_ov_masks, (unsigned long long)stat_ov_mask_bytes);
     if (stat_ov_rgbreads)
-        ps2_log("vk: 2D overlay -- %llu copies of slot 0's colour into another target "
+        ps2_log("vk: 2D overlay -- %llu copies of the scene target's colour into another target "
                 "kept the draws before them in place", (unsigned long long)stat_ov_rgbreads);
     if (stat_tex_collects)
         ps2_log("vk: texture pressure collection: %llu batches, %llu retired slots, "
@@ -5914,22 +6579,30 @@ void ps2_video_report(void) {
                 "renderer took them)", (unsigned long long)stat_dropped);
 }
 
+/* Batch RGB conversion by scanline: per-byte stdio locking caused multi-second
+ * capture stalls at high internal resolutions while holding renderer locks. */
+static int write_rgba_ppm(const char *path, const u8 *px, u32 stride,
+                          u32 ox, u32 oy, u32 w, u32 h) {
+    if (!px || !w || !h || ox > stride || w > stride - ox) return -1;
+    u8 *rgb = malloc((size_t)w * 3u);
+    if (!rgb) return -1;
+    FILE *fp = fopen(path, "wb");
+    if (!fp) { free(rgb); return -1; }
+    int failed = fprintf(fp, "P6\n%u %u\n255\n", w, h) < 0;
+    for (u32 y = 0; y < h && !failed; y++) {
+        const u8 *row = px + ((size_t)y + oy) * stride * 4u + (size_t)ox * 4u;
+        for (u32 x = 0; x < w; x++) {
+            rgb[x*3u]=row[x*4u]; rgb[x*3u+1]=row[x*4u+1]; rgb[x*3u+2]=row[x*4u+2];
+        }
+        failed = fwrite(rgb, 3u, w, fp) != w;
+    }
+    if (fclose(fp)) failed = 1;
+    free(rgb);
+    return failed ? -1 : 0;
+}
 static int write_ppm(const char *path, const u8 *px, u32 ox, u32 oy,
                      u32 w, u32 h) {
-    FILE *fp = fopen(path, "wb");
-    u32 x, y;
-    if (!fp) return -1;
-    fprintf(fp, "P6\n%u %u\n255\n", w, h);
-    for (y = 0; y < h; y++) {
-        const u8 *row = px + (size_t)(y + oy) * read_w * 4 + (size_t)ox * 4;
-        for (x = 0; x < w; x++) {
-            fputc(row[x * 4 + 0], fp);
-            fputc(row[x * 4 + 1], fp);
-            fputc(row[x * 4 + 2], fp);
-        }
-    }
-    fclose(fp);
-    return 0;
+    return write_rgba_ppm(path, px, read_w, ox, oy, w, h);
 }
 
 static int write_alpha_pgm(const char *path, const u8 *px, u32 w, u32 h) {
@@ -6102,14 +6775,15 @@ static VkDeviceMemory ovr_mem;
 static void *ovr_ptr;
 static VkDeviceSize ovr_cap;
 static int readback_overlay(void) {
+    vk_target *target = ov_display_presented ? &ov_display : &ov_comp;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkCommandBufferAllocateInfo ai = {0};
     VkCommandBufferBeginInfo bi = {0};
     VkSubmitInfo si = {0};
     u32 iw = ov_cw * ov_k, ih = ov_ch * ov_k;
     VkDeviceSize need = (VkDeviceSize)iw * ih * 4u;
-    VkImageLayout prev = ov_comp.layout;
-    if (!ov_comp.created || prev == VK_IMAGE_LAYOUT_UNDEFINED) return -1;
+    VkImageLayout prev = target->layout;
+    if (!target->created || prev == VK_IMAGE_LAYOUT_UNDEFINED) return -1;
     if (vkDeviceWaitIdle(dev) != VK_SUCCESS) return -1;
     if (need > ovr_cap) {
         if (ovr_ptr) vkUnmapMemory(dev, ovr_mem);
@@ -6129,7 +6803,7 @@ static int readback_overlay(void) {
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &bi);
-    barrier(cmd, ov_comp.color, VK_IMAGE_ASPECT_COLOR_BIT, prev,
+    barrier(cmd, target->color, VK_IMAGE_ASPECT_COLOR_BIT, prev,
             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
             VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
@@ -6137,9 +6811,9 @@ static int readback_overlay(void) {
         copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         copy.imageSubresource.layerCount = 1;
         copy.imageExtent = (VkExtent3D){iw, ih, 1};
-        vkCmdCopyImageToBuffer(cmd, ov_comp.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        vkCmdCopyImageToBuffer(cmd, target->color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                ovr_buf, 1, &copy); }
-    barrier(cmd, ov_comp.color, VK_IMAGE_ASPECT_COLOR_BIT,
+    barrier(cmd, target->color, VK_IMAGE_ASPECT_COLOR_BIT,
             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, prev,
             VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
             VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0);
@@ -6155,34 +6829,33 @@ static int readback_overlay(void) {
     return 0;
 }
 
+void ps2_vk_drain(void) {
+    if (!vk_ready) return;
+    pthread_mutex_lock(&list_lock);
+    while ((frame_requested || frame_rendering) && renderer_running > 0)
+        pthread_cond_wait(&list_cv, &list_lock);
+    pthread_mutex_unlock(&list_lock);
+}
+
 int ps2_vk_screenshot(const char *path) {
-    FILE *fp;
     const u8 *px = (const u8 *)read_ptr;
-    u32 x, y, w, h, ox, oy;
+    u32 w, h, ox, oy;
     if (!vk_ready) return -1;
     pthread_mutex_lock(&list_lock);
     pthread_mutex_lock(&gpu_lock);
-    if (ov_presented && !getenv("PS2_SHOT_NO_OVERLAY") && readback_overlay() == 0) {
+    if ((ov_presented || ov_display_presented) && !getenv("PS2_SHOT_NO_OVERLAY") && readback_overlay() == 0) {
         u32 k = ov_k, iw = ov_cw * k;
         u32 pw = present_w * k, ph = present_h * k;
         ox = present_x * k; oy = present_y * k;
         w = pw && pw <= iw ? pw : iw;
         h = ph && ph <= ov_ch * k ? ph : ov_ch * k;
-        fp = fopen(path, "wb");
-        if (fp) {
-            fprintf(fp, "P6\n%u %u\n255\n", w, h);
-            for (y = 0; y < h; y++)
-                for (x = 0; x < w; x++) {
-                    const u8 *p = (const u8 *)ovr_ptr + ((size_t)(oy + y) * iw + ox + x) * 4u;
-                    fputc(p[0], fp); fputc(p[1], fp); fputc(p[2], fp);
-                }
-            fclose(fp);
-            ps2_log("vk: frame written to %s (%ux%u, with the 2D overlay at %ux)",
-                    path, w, h, k);
-        }
+        if (ox + w > iw) ox = iw - w;
+        if (oy + h > ov_ch * k) oy = ov_ch * k - h;
+        int result = write_rgba_ppm(path, (const u8 *)ovr_ptr, iw, ox, oy, w, h);
+        if (!result) ps2_log("vk: frame written to %s (%ux%u, with the 2D overlay at %ux)", path, w, h, k);
         pthread_mutex_unlock(&gpu_lock);
         pthread_mutex_unlock(&list_lock);
-        return fp ? 0 : -1;
+        return result;
     }
     if (readback_targets(getenv("PS2_DUMP_RTS") != NULL) != 0) {
         pthread_mutex_unlock(&gpu_lock);
@@ -6246,26 +6919,11 @@ int ps2_vk_screenshot(const char *path) {
         if (ox + w > read_w) ox = read_w - w;
         if (oy + h > read_h) oy = read_h - h;
     }
-    fp = fopen(path, "wb");
-    if (!fp) {
-        pthread_mutex_unlock(&gpu_lock);
-        pthread_mutex_unlock(&list_lock);
-        return -1;
-    }
-    fprintf(fp, "P6\n%u %u\n255\n", w, h);
-    for (y = 0; y < h; y++) {
-        const u8 *row = px + (size_t)(y + oy) * read_w * 4 + (size_t)ox * 4;
-        for (x = 0; x < w; x++) {
-            fputc(row[x * 4 + 0], fp);
-            fputc(row[x * 4 + 1], fp);
-            fputc(row[x * 4 + 2], fp);
-        }
-    }
-    fclose(fp);
-    ps2_log("vk: frame written to %s (%ux%u)", path, w, h);
+    int result = write_ppm(path, px, ox, oy, w, h);
+    if (!result) ps2_log("vk: frame written to %s (%ux%u)", path, w, h);
     pthread_mutex_unlock(&gpu_lock);
     pthread_mutex_unlock(&list_lock);
-    return 0;
+    return result;
 }
 
 void ps2_video_shutdown(void) {

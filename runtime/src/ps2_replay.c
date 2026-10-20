@@ -10,13 +10,15 @@
 #include <stdint.h>
 #include <string.h>
 
+static u32 skip_field;
+static const char *field_shots;
 void ps2_gs_init(void);
 void ps2_gs_write_reg(u32 reg, u64 val);
 void ps2_gs_priv_write(u32 addr, u64 val);
 int  ps2_gs_present(void);
 void ps2_vu1_init(void);
 void ps2_gif_transfer(const ps2_reg128 *data, u32 qwc);
-void ps2_vif_fifo(int which, const ps2_reg128 *q);
+void ps2_vif_transfer(int which, const ps2_reg128 *q, u32 qwc);
 void ps2_vif_write(int which, u32 word);
 void ps2_vif_fbrst(int which, u32 val);
 void ps2_vif_clear_stall(int which);
@@ -31,6 +33,7 @@ const u8 *ps2_gs_framebuffer(u32 *w, u32 *h, u32 *stride);
 void ps2_gs_tex_census_report(void);
 void ps2_vu_profile_report(void);
 void ps2_vu_recomp_report(void);
+void ps2_gif_kick_report(void);
 void ps2_vu_census_report(void);
 void ps2_gs_blit_log_report(void);
 void ps2_gs_deinterlace(int off);
@@ -118,6 +121,7 @@ static void copy_into(u8 *dst, u32 dst_n, const u8 *src, u32 src_n) {
 }
 
 static void restore_snapshot(void) {
+    ps2_vk_replay_overlay_reset();
     u32 n;
     u8 *p;
     p = ps2_gs_vram_ptr(&n);
@@ -248,12 +252,7 @@ static void replay_pass(u32 field_limit, pass_result *res) {
             if (!p) { ok = 0; break; }
             ps2_cap_dict_insert(p, qwc * 16u);
             if (is_vif) {
-                u32 i;
-                if (!ps2_vif_stalled((int)(ch & 1u)))
-                    for (i = 0; i < qwc; i++) {
-                        ps2_vif_fifo((int)(ch & 1u), &((const ps2_reg128 *)p)[i]);
-                        if (ps2_vif_stalled((int)(ch & 1u))) break;
-                    }
+                ps2_vif_transfer((int)(ch & 1u), (const ps2_reg128 *)p, qwc);
             } else {
                 ps2_gif_transfer((const ps2_reg128 *)p, qwc);
             }
@@ -277,12 +276,7 @@ static void replay_pass(u32 field_limit, pass_result *res) {
                 break;
             }
             if (is_vif) {
-                u32 i, qwc = len / 16u;
-                if (!ps2_vif_stalled((int)(ch & 1u)))
-                    for (i = 0; i < qwc; i++) {
-                        ps2_vif_fifo((int)(ch & 1u), &((const ps2_reg128 *)p)[i]);
-                        if (ps2_vif_stalled((int)(ch & 1u))) break;
-                    }
+                ps2_vif_transfer((int)(ch & 1u), (const ps2_reg128 *)p, len / 16u);
             } else {
                 ps2_gif_transfer((const ps2_reg128 *)p, len / 16u);
             }
@@ -299,9 +293,21 @@ static void replay_pass(u32 field_limit, pass_result *res) {
             u32 parity = rd_u32(&ok);
             u64 prims, pixels, regs, trx, tpix;
             if (!ok) break;
+            if (skip_field && res->fields + 1 == skip_field) {
+                if (!ps2_vk_test_skip_next_present()) {
+                    fprintf(stderr,"[REPLAY] skip diagnostic rejected\n");exit(1);
+                }
+                fprintf(stderr,"[REPLAY] skipped presentation at relative field %u\n",skip_field);
+            }
             ps2_gs_set_field_parity(parity);
             if (!ps2_gs_present()) { res->closed = 1; ok = 0; break; }
             res->fields++;
+            if(field_shots) {
+                char file[1024];int n=snprintf(file,sizeof file,"%s.%04llu.ppm",field_shots,(unsigned long long)res->fields);
+                if(n<0 || (size_t)n>=sizeof file || ps2_vk_screenshot(file)!=0) {
+                    fprintf(stderr,"[REPLAY] field screenshot failed\n");exit(1);
+                }
+            }
             ps2_gs_stats(&prims, &pixels, &regs);
             ps2_gs_trx_stats(&trx, &tpix);
             if (have_exp) {
@@ -366,7 +372,12 @@ static void usage(const char *argv0) {
 "                  want for a measurement: with no Vulkan device, vertex_kick\n"
 "                  falls through to the software rasteriser, which is a\n"
 "                  different code path and about nine times slower\n"
+"  --field-shots P write P.NNNN.ppm for each field (hidden, bounded diagnostic)\n"
+"  --skip-field N  hidden diagnostic: skip presentation of one relative field\n"
 "  --shot FILE     write the last frame as a PPM (default ps2_replay.ppm)\n"
+"  --hidden        render with Vulkan in a hidden window for capture tests\n"
+"  --aniso-cycle   test 16/off/4/16 sampler transitions; requires --hidden --loop 4\n"
+"  --window-cycle  test 720p/1080p/4K/720p window transitions; requires --hidden --loop 4\n"
 "  --verbose       the runtime's own tracing\n"
 "  --loud          report every field that differs from the recorded run\n"
 "  --census        arm the per-primitive censuses and draw traces.  They are\n"
@@ -383,7 +394,7 @@ static void usage(const char *argv0) {
 int main(int argc, char **argv) {
     const char *path = "out/capture.gscap";
     const char *shot = "ps2_replay.ppm";
-    int want_video = 1, bench = 0, loops = 1, census = 0;
+    int want_video = 1, bench = 0, loops = 1, census = 0, hidden = 0, aniso_cycle = 0, window_cycle = 0;
     u32 fuzz_start = 0, fuzz_iters = 0, fuzz_seed = 1;
     u32 field_limit = 0;
     double t_total = 0.0;
@@ -397,6 +408,11 @@ int main(int argc, char **argv) {
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--novideo")) want_video = 0;
+        else if (!strcmp(argv[i], "--hidden")) hidden = 1;
+        else if (!strcmp(argv[i], "--aniso-cycle")) aniso_cycle = 1;
+        else if (!strcmp(argv[i], "--window-cycle")) window_cycle = 1;
+        else if (!strcmp(argv[i], "--field-shots") && i+1<argc) field_shots=argv[++i];
+        else if (!strcmp(argv[i], "--skip-field") && i+1<argc) skip_field=(u32)strtoul(argv[++i],NULL,0);
         else if (!strcmp(argv[i], "--shot") && i + 1 < argc) shot = argv[++i];
         else if (!strcmp(argv[i], "--verbose")) ps2_verbose = 1;
         else if (!strcmp(argv[i], "--loud")) quiet = 0;
@@ -415,6 +431,19 @@ int main(int argc, char **argv) {
         }
         else if (argv[i][0] != '-') path = argv[i];
         else { usage(argv[0]); return strcmp(argv[i], "--help") ? 1 : 0; }
+    }
+
+    if(field_shots && (!hidden || !want_video || loops!=1 || fuzz_start || !field_limit || field_limit>120)) {
+        fprintf(stderr,"[REPLAY] --field-shots requires hidden video, one pass and 1..120 fields\n");return 1;
+    }
+    if(skip_field && (!hidden || !want_video || loops!=1 || fuzz_start || skip_field>=field_limit)) {
+        fprintf(stderr,"[REPLAY] --skip-field requires hidden video, one pass, and a later final field\n");return 1;
+    }
+    if(window_cycle && (!want_video || !hidden || loops!=4 || aniso_cycle || fuzz_start)) {
+        fprintf(stderr,"[REPLAY] --window-cycle requires --hidden --loop 4, video and no --aniso-cycle or fuzz mode\n");return 1;
+    }
+    if(aniso_cycle && (!want_video || !hidden || loops!=4)) {
+        fprintf(stderr,"[REPLAY] --aniso-cycle requires --hidden --loop 4 and video\n");return 1;
     }
 
     { const char *e = getenv("PS2_CENSUS");
@@ -510,6 +539,7 @@ int main(int argc, char **argv) {
     {   const char *e = getenv("PS2_LOCKSTEP");
         ps2_vk_lockstep = (e && *e) ? (*e != '0') : 1;
     }
+    if (hidden) ps2_video_hidden(1);
     if (want_video && ps2_video_init("gsreplay", 640, 448) != 0) {
         fprintf(stderr, "[REPLAY] no video; continuing headless\n");
         want_video = 0;
@@ -534,6 +564,22 @@ int main(int argc, char **argv) {
     for (pass = 0; loops == 0 || pass < loops; pass++) {
         pass_result r;
         double t0, dt;
+        if(aniso_cycle) {
+            const int values[4]={16,0,4,16};
+            ps2_vk_drain();
+            if(!ps2_vk_set_anisotropy(values[pass])) {
+                fprintf(stderr,"[REPLAY] sampler transition failed\n");return 1;
+            }
+            fprintf(stderr,"[REPLAY] sampler cycle pass %d: %dx\n",pass+1,values[pass]);
+        }
+        if(window_cycle) {
+            const int widths[4]={1280,1920,3840,1280},heights[4]={720,1080,2160,720};
+            ps2_vk_drain();
+            if(!ps2_vk_test_resize_window(widths[pass],heights[pass])) {
+                fprintf(stderr,"[REPLAY] window transition failed\n");return 1;
+            }
+            fprintf(stderr,"[REPLAY] window cycle pass %d: %dx%d\n",pass+1,widths[pass],heights[pass]);
+        }
         restore_snapshot();
         if (bench) ps2_phase_init();
         t0 = ps2_wall_seconds();
@@ -586,6 +632,13 @@ int main(int argc, char **argv) {
             ps2_gs_draw_census_report();
             ps2_gs_blit_log_report();
         }
+        if(aniso_cycle || window_cycle) {
+            ps2_vk_drain();
+            size_t length=strlen(shot)+32u;
+            char *name=malloc(length);if(!name)return 1;
+            snprintf(name,length,"%s.pass%d.ppm",shot,pass+1);
+            ps2_vk_screenshot(name);free(name);
+        }
         if (r.closed) { fprintf(stderr, "[REPLAY] window closed\n"); break; }
         if (want_video && ps2_vk_closed()) break;
     }
@@ -597,8 +650,12 @@ int main(int argc, char **argv) {
                 (double)fields_total / t_total,
                 t_total * 1000.0 / (double)fields_total);
     fclose(rf);
+    /* The final published field may still be waiting for the render thread.
+     * Drain it before collecting coverage or reading its screenshot. */
+    if (want_video) ps2_vk_drain();
     ps2_host_prof_report();
     ps2_vu_recomp_report();
+    ps2_gif_kick_report();
     ps2_vu_census_report();
     rn_report();
     {   extern int ps2_vk_enabled(void);
@@ -642,6 +699,7 @@ void ps2_capture_report(const char *why) { (void)why; }
 int rn_taps_on;
 void rn_dma_attrib_slow(int ch, u32 tadr) { (void)ch; (void)tadr; }
 int rn_intents_pending;
+u32 rn_dma_chunk_limit(u32 madr,u32 qwc) {(void)madr;return qwc;}
 void rn_dma_transfer_slow(int ch, u32 madr, u32 qwc, int after) {
     (void)ch; (void)madr; (void)qwc; (void)after;
 }
